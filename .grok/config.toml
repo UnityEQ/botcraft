@@ -1,0 +1,10 @@
+# Project-scoped Browser Use MCP. Same Python helpers as the CLI.
+# A new Grok session is required after this file is first added.
+[mcp_servers.browser-use]
+command = "uvx"
+args = ["--python", "3.12", "browser-use@latest", "--cli-mcp"]
+enabled = true
+startup_timeout_sec = 120
+
+[plugins]
+enabled = ["browser-use"]
