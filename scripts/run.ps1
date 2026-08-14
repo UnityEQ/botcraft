@@ -21,7 +21,19 @@ if (-not (Test-BrowserDaemon)) {
 }
 
 $resolved = Resolve-Path -LiteralPath $Script
-Get-Content -LiteralPath $resolved -Raw | browser-use
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
-}
+$isHunt = [System.IO.Path]::GetFileName("$resolved") -eq "woc_hunt_loop.py"
+
+do {
+    if (-not (Test-BrowserDaemon)) {
+        Write-Host "Daemon not running - starting it. Click Allow in Chrome if a popup appears."
+        & "$PSScriptRoot\start-daemon.ps1"
+    }
+    Get-Content -LiteralPath $resolved -Raw | browser-use
+    $code = $LASTEXITCODE
+    if (-not $isHunt) {
+        if ($code -ne 0) { exit $code }
+        break
+    }
+    Write-Host "Hunt process exited code $code at $(Get-Date -Format 'HH:mm:ss') - restarting in 3s (Ctrl+C to stop)"
+    Start-Sleep -Seconds 3
+} while ($true)

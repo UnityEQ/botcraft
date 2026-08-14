@@ -56,6 +56,9 @@ DANGER_KEEP = 22.0
 MIN_PULL_HP_FRAC = 0.8
 # Always allow pulls at least this many levels above the player.
 HUNT_LEVEL_ABOVE = 1
+# A +1 mob is worth this many extra yards vs a same-level. Keeps pulls local
+# but prefers the best legal level among nearby targets.
+HUNT_LEVEL_YARDS = 18.0
 
 
 def hunt_max_level(player_level):
@@ -113,16 +116,23 @@ def go_safespot(stop_at=5.0, max_s=28.0):
     return s
 
 
-def activate_game():
-    tabs = list_tabs(include_chrome=False)
-    for t in tabs:
-        url = (t.get("url") or "").lower()
-        if "claudecraft" in url:
-            tid = t.get("targetId") or t.get("target_id")
-            cdp("Target.activateTarget", targetId=tid)
-            install_combat_hook()
-            return tid
-    raise RuntimeError("World of ClaudeCraft tab not found")
+def activate_game(retries=8):
+    last = None
+    for attempt in range(max(1, retries)):
+        try:
+            tabs = list_tabs(include_chrome=False)
+            for t in tabs:
+                url = (t.get("url") or "").lower()
+                if "claudecraft" in url:
+                    tid = t.get("targetId") or t.get("target_id")
+                    cdp("Target.activateTarget", targetId=tid)
+                    install_combat_hook()
+                    return tid
+            last = RuntimeError("World of ClaudeCraft tab not found")
+        except Exception as err:
+            last = err
+        time.sleep(1.5)
+    raise RuntimeError(f"World of ClaudeCraft tab not found ({last})")
 
 
 def install_combat_hook():
@@ -166,7 +176,33 @@ def install_combat_hook():
 
 
 def j(code):
-    return js(code)
+    """js() with retries — Chrome/CDP drops show up as WinError 64 / timeouts."""
+    last = None
+    for attempt in range(5):
+        try:
+            return js(code)
+        except Exception as err:
+            last = err
+            msg = str(err).lower()
+            transient = any(
+                tok in msg
+                for tok in (
+                    "winerror 64",
+                    "network name",
+                    "timed out",
+                    "timeout",
+                    "connection",
+                    "10054",
+                    "10053",
+                    "10061",
+                    "broken pipe",
+                    "eof",
+                )
+            )
+            if not transient:
+                raise
+            time.sleep(0.6 + attempt * 0.4)
+    raise last
 
 
 def stop():
@@ -927,11 +963,17 @@ def pick_isolated(name_sub=None, level=None, min_level=None, max_level=None, min
                 "xyz": xyz_of(h),
             }
         )
+    def _hunt_score(c):
+        d = c.get("dist") or 99.0
+        lv = c.get("level") or 1
+        return d - HUNT_LEVEL_YARDS * (lv - player_level)
+
     cands.sort(
         key=lambda c: (
             -(c.get("why") is None),
+            _hunt_score(c),
             c["dist"],
-            abs((c.get("level") or 1) - player_level),
+            -((c.get("level") or 1)),
             -c["isolation"],
             -c["path"],
             -c["danger"],

@@ -557,16 +557,25 @@ def check_after(round_i, log):
 
 
 def loop():
-    activate_game()
-    stop()
-    s0 = snapshot()
-    if s0.get("ok"):
-        set_safespot(s0)
     fail = 0
     kills = 0
     i = 0
     last_rounds = []
     try:
+        while True:
+            try:
+                activate_game()
+                stop()
+                if SAFESPOT is None:
+                    s0 = snapshot()
+                    if s0.get("ok"):
+                        set_safespot(s0)
+                break
+            except KeyboardInterrupt:
+                raise
+            except Exception as err:
+                print("WAIT activate_game", type(err).__name__, str(err)[:400])
+                time.sleep(3)
         while True:
             i += 1
             if ROUNDS and i > ROUNDS:
@@ -647,12 +656,18 @@ def loop():
                     print("DEFENDED", json.dumps(killed))
             except KeyboardInterrupt:
                 raise
-            except Exception as err:
+            except SystemExit:
+                raise
+            except BaseException as err:
                 print("ROUND_ERROR", type(err).__name__, str(err)[:800])
                 fail += 1
                 try:
                     stop()
                     attack(False)
+                except Exception:
+                    pass
+                try:
+                    activate_game()
                 except Exception:
                     pass
                 time.sleep(3)
