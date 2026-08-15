@@ -58,8 +58,11 @@ PULL_HOME_MAX = 28.0
 FLEE_MIN_YARDS = 22.0
 # Only keep sprinting this far if they have not dropped yet.
 FLEE_AWAY_YARDS = 32.0
-# Hard cap so a long chase does not cross the map.
-FLEE_HOME_MAX = 56.0
+# Stop sprinting away at this range. The walk HOME after a drop can be farther —
+# gap-finding + Blink often leaves us 50-80y out.
+FLEE_HOME_MAX = 80.0
+# After a flee, walking this far back to the start stamp is still our home.
+RETURN_HOME_MAX = 90.0
 # aiState values that mean the NPC is no longer chasing us.
 _FLEE_RETURN_AI = frozenset(("idle", "wander", "return", "evade", "reset", "leash", "home"))
 MELEE_RANGE = 6.0
@@ -2912,8 +2915,8 @@ def flee_to_safespot(stop_at=5.0, max_s=24.0):
             )
             s = go_safespot(
                 stop_at=stop_at,
-                max_s=home_s,
-                max_away=FLEE_HOME_MAX,
+                max_s=max(home_s, 22.0),
+                max_away=RETURN_HOME_MAX,
                 defend_on_aggro=False,
             )
             if not s.get("ok") or s.get("dead"):
@@ -3109,7 +3112,7 @@ def recover(hp_frac=0.95, mana_frac=0.9):
         attack(False)
         home_hot = bool(SAFESPOT and hostiles_near_point(s, SAFESPOT["x"], SAFESPOT["z"], SIT_CLEAR_YARDS))
         if not close_hostiles(s, SIT_CLEAR_YARDS) and not home_hot:
-            s = go_safespot(max_s=24.0, max_away=FLEE_HOME_MAX)
+            s = go_safespot(max_s=24.0, max_away=RETURN_HOME_MAX)
             if s.get("dead"):
                 return s
     for _attempt in range(12):
@@ -3145,7 +3148,7 @@ def recover(hp_frac=0.95, mana_frac=0.9):
                         ),
                     )
                 else:
-                    s = go_safespot(max_s=24.0, max_away=FLEE_HOME_MAX, defend_on_aggro=False)
+                    s = go_safespot(max_s=24.0, max_away=RETURN_HOME_MAX, defend_on_aggro=False)
                     if s.get("dead"):
                         return s
                     if attackers(s) or close_hostiles(s, SIT_CLEAR_YARDS):

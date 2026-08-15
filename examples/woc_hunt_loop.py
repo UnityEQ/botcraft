@@ -235,16 +235,24 @@ def hunt():
                     "mob": xyz_of(mob) if mob else None,
                 },
             )
-            go_safespot(stop_at=5.0, max_s=12.0)
+            go_safespot(stop_at=5.0, max_s=16.0, max_away=RETURN_HOME_MAX)
             return log
         home_now = dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"])
-        if home_now > PULL_HOME_MAX:
+        if home_now > RETURN_HOME_MAX:
             note("skip_bad_home_xyz", {"dist": round(home_now, 1), "home": SAFESPOT, "me": [s.get("x"), s.get("z")]})
             stop()
             return log
+        if home_now > PULL_HOME_MAX:
+            note("return_home_after_flee", {"dist": round(home_now, 1), "home": SAFESPOT, "me": [s.get("x"), s.get("z")]})
+            go_safespot(stop_at=5.0, max_s=20.0, max_away=RETURN_HOME_MAX)
+            s = snapshot()
+            home_now = dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) if s.get("ok") else home_now
+            if home_now > PULL_HOME_MAX:
+                note("still_far_from_home", {"dist": round(home_now, 1)})
+                return log
         if home_now > 5.0:
             note("return_home_before_tag", {"dist": round(home_now, 1), "mob_from_home": round(mob_from_home, 1)})
-            go_safespot(stop_at=5.0, max_s=8.0, max_away=PULL_HOME_MAX)
+            go_safespot(stop_at=5.0, max_s=12.0, max_away=RETURN_HOME_MAX)
             s = snapshot()
             mob = entity(wid)
         if mob and (mob.get("dist") or 99) > CAST_RANGE:
@@ -276,7 +284,7 @@ def hunt():
                 ],
             },
         )
-        go_safespot(stop_at=5.0, max_s=16.0)
+        go_safespot(stop_at=5.0, max_s=16.0, max_away=RETURN_HOME_MAX)
         return log
     aggro = attackers(s)
     if aggro:
@@ -290,7 +298,7 @@ def hunt():
     if mob["dist"] < MELEE_RANGE:
         note("too_close_backing_out", {"dist": mob["dist"]})
         if SAFESPOT:
-            go_safespot(stop_at=5.0, max_s=8.0)
+            go_safespot(stop_at=5.0, max_s=12.0, max_away=RETURN_HOME_MAX)
         else:
             s = back_off(mob["x"], mob["z"], yards=PULL_RANGE, max_s=5)
         mob = entity(wid)
@@ -302,7 +310,7 @@ def hunt():
     if s.get("dead") or s["hp"] < s["maxHp"] * MIN_PULL_HP_FRAC:
         note("skip_low_hp_before_pull", {"hp": s.get("hp"), "maxHp": s.get("maxHp")})
         if SAFESPOT:
-            go_safespot(stop_at=5.0, max_s=12.0)
+            go_safespot(stop_at=5.0, max_s=16.0, max_away=RETURN_HOME_MAX)
         return log
 
     # Tag with Attack (1) and run. Do not plant a Cinderbolt or Barrier in the camp.
