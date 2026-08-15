@@ -115,6 +115,8 @@ HOME_WALK_YARDS = 90.0
 HOME_MATCH_YARDS = 40.0
 # Tab this process owns. j() always evaluates here so another hunt cannot steal reads.
 BOUND_TID = None
+# Combat hook is installed once per bind. Reinstalling it every round times out.
+_HOOK_OK = False
 
 
 def _safespot_path(name):
@@ -539,6 +541,11 @@ def kite_to_safespot(ignore_id=None, stop_at=6.0, max_s=22.0):
     return s, "timeout"
 
 
+def _is_eval_timeout(err):
+    msg = str(err or "").lower()
+    return "timed out" in msg or "timeout" in msg
+
+
 def _tab_player_info(tid=None):
     """Read the in-world character on this tab. tid avoids reading the wrong page."""
     code = r"""
@@ -555,40 +562,68 @@ def _tab_player_info(tid=None):
             return js(code, target_id=tid) or {}
         return j(code) or {}
     except Exception as err:
-        return {"ok": False, "reason": type(err).__name__}
+        reason = "timeout" if _is_eval_timeout(err) else type(err).__name__
+        return {"ok": False, "reason": reason}
 
 
 def _bound_player_ok():
     if not BOUND_TID:
         return False
     info = _tab_player_info(BOUND_TID)
-    if not info.get("ok"):
-        return False
-    want = wanted_player()
-    name = (info.get("name") or "").strip()
-    if want and name.lower() != want.lower():
-        return False
-    return True
+    if info.get("ok"):
+        want = wanted_player()
+        name = (info.get("name") or "").strip()
+        if want and name.lower() != want.lower():
+            return False
+        return True
+    # A busy frame times out the name read. The tab is still ours — do not unbind.
+    if info.get("reason") in ("timeout", "RuntimeError"):
+        return True
+    return False
+
+
+def _bind_tab(tid, name, url):
+    global BOUND_TID, _HOOK_OK
+    try:
+        switch_tab(tid)
+    except Exception:
+        cdp("Target.activateTarget", targetId=tid)
+    BOUND_TID = tid
+    _HOOK_OK = False
+    try:
+        _HOOK_OK = bool(install_combat_hook())
+    except Exception:
+        pass
+    print("BOUND", json.dumps({"player": name or None, "want": wanted_player() or None, "tab": (url or "")[:80]}))
+    return tid
 
 
 def activate_game(retries=8):
     """Bind the ClaudeCraft tab. WOC_PLAYER pins a character when several tabs exist."""
-    global BOUND_TID
+    global BOUND_TID, _HOOK_OK
     last = None
     want = wanted_player().lower()
-    if _bound_player_ok():
-        # Keep this hunt on its own tab. Scanning every round switch_tab's the other character.
+    if BOUND_TID:
+        # Keep this hunt on its own tab. Do not re-read the player or
+        # reinstall the combat hook every round — that is what timed out.
         try:
             cdp("Target.activateTarget", targetId=BOUND_TID)
         except Exception:
-            pass
-        install_combat_hook()
-        return BOUND_TID
+            BOUND_TID = None
+            _HOOK_OK = False
+        else:
+            if not _HOOK_OK:
+                try:
+                    _HOOK_OK = bool(install_combat_hook())
+                except Exception:
+                    pass
+            return BOUND_TID
     for attempt in range(max(1, retries)):
         try:
             tabs = list_tabs(include_chrome=False)
             found = []
             match = None
+            busy = []
             for t in tabs:
                 url = (t.get("url") or "").lower()
                 if "claudecraft" not in url:
@@ -600,6 +635,9 @@ def activate_game(retries=8):
                 name = (info.get("name") or "").strip()
                 label = name or info.get("reason") or "?"
                 found.append({"title": (t.get("title") or "")[:40], "player": label})
+                if info.get("reason") in ("timeout", "RuntimeError"):
+                    busy.append((tid, url))
+                    continue
                 if not info.get("ok"):
                     continue
                 if want and name.lower() != want:
@@ -608,14 +646,11 @@ def activate_game(retries=8):
                 break
             if match:
                 tid, name, url = match
-                try:
-                    switch_tab(tid)
-                except Exception:
-                    cdp("Target.activateTarget", targetId=tid)
-                install_combat_hook()
-                BOUND_TID = tid
-                print("BOUND", json.dumps({"player": name or None, "want": want or None, "tab": url[:80]}))
-                return tid
+                return _bind_tab(tid, name, url)
+            # Game thread was busy. One ClaudeCraft tab + a pinned name: keep that tab.
+            if want and len(busy) == 1:
+                tid, url = busy[0]
+                return _bind_tab(tid, want, url)
             if want:
                 last = RuntimeError(
                     "WOC_PLAYER=%s not in any in-world ClaudeCraft tab (saw %s)" % (want, found or "none")
@@ -624,14 +659,16 @@ def activate_game(retries=8):
                 last = RuntimeError("World of ClaudeCraft tab not found (saw %s)" % (found or "none"))
         except Exception as err:
             last = err
-        BOUND_TID = None
         time.sleep(1.5)
     raise RuntimeError(f"World of ClaudeCraft tab not found ({last})")
 
 
 def install_combat_hook():
     """Catch damage-taken the same frame the combat log writes 'X hits you'."""
-    return j(
+    global _HOOK_OK
+    if _HOOK_OK:
+        return True
+    ok = j(
         r"""
 (() => {
   const g = window.__game;
@@ -667,6 +704,8 @@ def install_combat_hook():
 })()
 """
     )
+    _HOOK_OK = bool(ok)
+    return _HOOK_OK
 
 
 def j(code):
@@ -680,6 +719,7 @@ def j(code):
         except Exception as err:
             last = err
             msg = str(err).lower()
+            is_timeout = "timed out" in msg or "timeout" in msg
             transient = any(
                 tok in msg
                 for tok in (
@@ -697,13 +737,17 @@ def j(code):
             )
             if not transient:
                 raise
-            time.sleep(0.6 + attempt * 0.4)
+            # A busy game frame will time out again. Two tries is enough.
+            if is_timeout and attempt >= 1:
+                raise
+            time.sleep(0.25 if is_timeout else (0.6 + attempt * 0.4))
     raise last
 
 
 def stop():
     """Drop scripted movement so this tick stands still. Keyboard works again after this."""
-    return j(
+    try:
+        return j(
         """
 (() => {
   const g = window.__game;
@@ -724,7 +768,12 @@ def stop():
   return {ok: true};
 })()
 """
-    )
+        )
+    except Exception as err:
+        if _is_eval_timeout(err):
+            print("STOP timeout")
+            return {"ok": False, "reason": "timeout"}
+        raise
 
 
 _HALTED = False
@@ -801,78 +850,63 @@ def xyz_of(e):
     return [round(e.get("x") or 0, 2), round(e.get("y") or 0, 2), round(e.get("z") or 0, 2)]
 
 
-def _snapshot_raw():
-    return j(
-        r"""
+_SNAPSHOT_JS = r"""
 (() => {
   const g = window.__game;
   if (!g || !g.world) return { ok: false };
   const w = g.world;
   const p = w.entities.get(w.playerId);
   if (!p) return { ok: false };
+  const px = p.pos.x, py = p.pos.y, pz = p.pos.z;
   const ents = [];
   w.entities.forEach((e) => {
     if (!e || e.id === w.playerId) return;
+    const k = e.kind;
+    if (k !== 'mob' && k !== 'npc') return;
     const ep = e.pos || {};
-    const d = Math.hypot((ep.x ?? 0) - p.pos.x, (ep.z ?? 0) - p.pos.z);
-    const x = ep.x ?? 0, y = ep.y ?? 0, z = ep.z ?? 0;
+    const x = ep.x ?? 0, z = ep.z ?? 0;
+    const d = Math.hypot(x - px, z - pz);
+    if (d > 90) return;
     ents.push({
-      id: e.id, kind: e.kind, name: e.name, level: e.level,
+      id: e.id, kind: k, name: e.name, level: e.level,
       hp: e.hp, maxHp: e.maxHp, dead: !!e.dead, hostile: !!e.hostile,
-      templateId: e.templateId,
+      templateId: e.templateId || null,
       x: Math.round(x * 100) / 100,
-      y: Math.round(y * 100) / 100,
+      y: Math.round((ep.y ?? 0) * 100) / 100,
       z: Math.round(z * 100) / 100,
       dist: Math.round(d * 100) / 100,
-      dist3: Math.round(Math.hypot(x - p.pos.x, y - p.pos.y, z - p.pos.z) * 100) / 100,
-      facing: e.facing ?? null,
       targetId: e.targetId || null,
       aggroTargetId: e.aggroTargetId || null,
       inCombat: !!e.inCombat,
       aiState: e.aiState || null,
-      evadeEpoch: e.evadeEpoch || 0,
-      chaseStall: e.chaseStall || 0,
-      vx: Math.round((e.vx || 0) * 100) / 100,
-      vz: Math.round((e.vz || 0) * 100) / 100
+      evadeEpoch: e.evadeEpoch || 0
     });
   });
   ents.sort((a, b) => a.dist - b.dist);
   const now = Date.now();
   const hook = window.__wocCombat || { incoming: [] };
-  const recentHits = (hook.incoming || []).filter((h) => now - (h.t || 0) < 8000);
   const hitByIds = [];
-  for (const h of recentHits) {
-    if (h.sourceId != null && !hitByIds.includes(h.sourceId)) hitByIds.push(h.sourceId);
+  const incoming = hook.incoming || [];
+  for (let i = incoming.length - 1; i >= 0; i--) {
+    const h = incoming[i];
+    if (!h || now - (h.t || 0) >= 8000) continue;
+    if (h.sourceId != null && hitByIds.indexOf(h.sourceId) < 0) hitByIds.push(h.sourceId);
   }
-  const hitByNames = [];
-  const hitRe = /^(.+?) (?:critically )?hits you for /;
-  const logEl = g.hud && g.hud.combatLogEl;
-  const kids = logEl ? logEl.children : [];
-  for (let i = Math.max(0, kids.length - 16); i < kids.length; i++) {
-    const t = (kids[i].innerText || '').trim();
-    const m = t.match(hitRe);
-    if (m && !hitByNames.includes(m[1])) hitByNames.push(m[1]);
+  const cds = {};
+  if (p.cooldowns && typeof p.cooldowns.forEach === 'function') {
+    p.cooldowns.forEach((v, k) => { cds[k] = Math.round((v || 0) * 100) / 100; });
   }
   return {
     ok: true,
-    id: p.id,
-    name: p.name,
-    level: p.level,
-    hp: p.hp,
-    maxHp: p.maxHp,
-    mana: p.resource,
-    maxMana: p.maxResource,
-    dead: !!p.dead,
-    sitting: !!p.sitting,
-    eating: !!p.eating,
-    drinking: !!p.drinking,
-    x: Math.round(p.pos.x * 100) / 100,
-    y: Math.round(p.pos.y * 100) / 100,
-    z: Math.round(p.pos.z * 100) / 100,
-    facing: p.facing,
-    targetId: p.targetId,
-    xp: w.xp,
-    copper: w.copper,
+    id: p.id, name: p.name, level: p.level,
+    hp: p.hp, maxHp: p.maxHp,
+    mana: p.resource, maxMana: p.maxResource,
+    dead: !!p.dead, sitting: !!p.sitting, eating: !!p.eating, drinking: !!p.drinking,
+    x: Math.round(px * 100) / 100,
+    y: Math.round(py * 100) / 100,
+    z: Math.round(pz * 100) / 100,
+    facing: p.facing, targetId: p.targetId,
+    xp: w.xp, copper: w.copper,
     auras: (p.auras || []).map((a) => ({
       id: a.id,
       remaining: Math.round((a.remaining || 0) * 10) / 10
@@ -884,31 +918,88 @@ def _snapshot_raw():
     castingAbility: p.castingAbility || null,
     castRemaining: Math.round((p.castRemaining || 0) * 100) / 100,
     swingTimer: Math.round((p.swingTimer || 0) * 100) / 100,
-    cooldowns: (() => {
-      const o = {};
-      const cds = p.cooldowns;
-      if (cds && typeof cds.forEach === 'function') {
-        cds.forEach((v, k) => { o[k] = Math.round((v || 0) * 100) / 100; });
-      }
-      return o;
-    })(),
+    cooldowns: cds,
     inventory: (w.inventory || []).map((it) => ({
       id: it.itemId || it.id,
       count: it.count || it.qty || 0
     })),
     hitByIds,
-    hitByNames,
+    hitByNames: [],
     lastHitAt: hook.lastEventAt || 0,
     ents
   };
 })()
 """
-    )
+
+_SNAPSHOT_LITE_JS = r"""
+(() => {
+  const g = window.__game;
+  if (!g || !g.world) return { ok: false, reason: 'no_game' };
+  const w = g.world;
+  const p = w.entities.get(w.playerId);
+  if (!p) return { ok: false, reason: 'no_player' };
+  const px = p.pos.x, pz = p.pos.z;
+  const ents = [];
+  w.entities.forEach((e) => {
+    if (!e || e.id === w.playerId || e.dead) return;
+    if (e.kind !== 'mob' && e.kind !== 'npc') return;
+    if (!e.hostile) return;
+    const d = Math.hypot((e.pos?.x ?? 0) - px, (e.pos?.z ?? 0) - pz);
+    if (d > 40) return;
+    ents.push({
+      id: e.id, kind: e.kind, name: e.name, level: e.level,
+      hp: e.hp, maxHp: e.maxHp, dead: false, hostile: true,
+      templateId: e.templateId || null,
+      x: e.pos.x, y: e.pos.y, z: e.pos.z,
+      dist: Math.round(d * 100) / 100,
+      targetId: e.targetId || null,
+      aggroTargetId: e.aggroTargetId || null,
+      inCombat: !!e.inCombat,
+      aiState: e.aiState || null,
+      evadeEpoch: e.evadeEpoch || 0
+    });
+  });
+  return {
+    ok: true, lite: true,
+    id: p.id, name: p.name, level: p.level,
+    hp: p.hp, maxHp: p.maxHp, mana: p.resource, maxMana: p.maxResource,
+    dead: !!p.dead, sitting: !!p.sitting, eating: !!p.eating, drinking: !!p.drinking,
+    x: p.pos.x, y: p.pos.y, z: p.pos.z, facing: p.facing, targetId: p.targetId,
+    xp: w.xp, copper: w.copper, auras: [],
+    autoAttack: !!p.autoAttack, inCombat: !!p.inCombat,
+    combatExitHoldUntil: p.combatExitHoldUntil || 0,
+    gcdRemaining: p.gcdRemaining || 0,
+    castingAbility: p.castingAbility || null,
+    castRemaining: p.castRemaining || 0,
+    swingTimer: p.swingTimer || 0,
+    cooldowns: {}, inventory: [],
+    hitByIds: [], hitByNames: [], lastHitAt: 0, ents
+  };
+})()
+"""
+
+
+def _snapshot_raw():
+    try:
+        return j(_SNAPSHOT_JS) or {"ok": False}
+    except Exception as err:
+        if not _is_eval_timeout(err):
+            raise
+        try:
+            lite = j(_SNAPSHOT_LITE_JS)
+            if lite and lite.get("ok"):
+                print("SNAPSHOT lite after timeout")
+                return lite
+        except Exception:
+            pass
+        return {"ok": False, "reason": "timeout"}
 
 
 def snapshot():
     """Read this hunt's character only. A leaked snapshot from another tab walks us to their xyz."""
     data = _snapshot_raw()
+    if data and data.get("reason") == "timeout":
+        return data
     want = _name_key(wanted_player()) or _name_key(SAFESPOT_OWNER)
     if not want:
         return data or {"ok": False}
@@ -926,13 +1017,8 @@ def snapshot():
         data = _snapshot_raw()
         if data and data.get("ok") and _name_key(data.get("name")) == want:
             return data
-    try:
-        activate_game(retries=2)
-    except Exception:
-        pass
-    data = _snapshot_raw()
-    if data and data.get("ok") and _name_key(data.get("name")) == want:
-        return data
+        if data and data.get("reason") == "timeout":
+            return data
     return {"ok": False, "reason": "wrong_player", "name": (data or {}).get("name")}
 
 
@@ -968,7 +1054,8 @@ def away_from_own_home(s):
 
 
 def entity(eid):
-    return j(
+    try:
+        return j(
         f"""
 (() => {{
   const w = window.__game.world;
@@ -990,14 +1077,15 @@ def entity(eid):
     aggroTargetId: e.aggroTargetId || null,
     inCombat: !!e.inCombat,
     aiState: e.aiState || null,
-    evadeEpoch: e.evadeEpoch || 0,
-    chaseStall: e.chaseStall || 0,
-    vx: Math.round((e.vx || 0) * 100) / 100,
-    vz: Math.round((e.vz || 0) * 100) / 100
+    evadeEpoch: e.evadeEpoch || 0
   }};
 }})()
 """
-    )
+        )
+    except Exception as err:
+        if _is_eval_timeout(err):
+            return None
+        raise
 
 
 def living_hostiles(s=None):
@@ -1019,9 +1107,39 @@ def mobs():
     return _MOBS
 
 
+def template_of(mob):
+    return mobs().get((mob or {}).get("templateId") or "") or {}
+
+
 def template_flags(mob):
-    tmpl = mobs().get((mob or {}).get("templateId") or "") or {}
+    tmpl = template_of(mob)
     return bool(tmpl.get("rare")), bool(tmpl.get("elite"))
+
+
+def is_boss(mob):
+    return bool(template_of(mob).get("boss"))
+
+
+def is_dummy_mob(mob):
+    """Quest props and scenery that look hostile but are not a fight.
+
+    Broodmother Egg (spider_egg): xpMult 0, dmg 0, moveSpeed 0, requiresQuestId.
+    Same shape as Spider Egg-Sac and Dragonkin Egg. Widow Hatchling has xp
+    and damage — that is a real add, not a dummy.
+    """
+    if not mob:
+        return False
+    tmpl = template_of(mob)
+    if tmpl.get("requiresQuestId"):
+        return True
+    if tmpl.get("xpMult") == 0:
+        return True
+    if tmpl.get("dmgBase") == 0 and tmpl.get("moveSpeed") == 0 and tmpl.get("aggroRadius") == 0:
+        return True
+    if tmpl:
+        return False
+    blob = ((mob.get("name") or "") + " " + (mob.get("templateId") or "")).lower()
+    return "egg" in blob
 
 
 def is_overlevel(mob, player_level):
@@ -1035,11 +1153,13 @@ def is_overlevel(mob, player_level):
 
 
 def is_too_hard(mob, player_level):
-    """Flee / do-not-open: over-level or rare. Same-band elite is keepaway, not a flee."""
+    """Flee / do-not-open: over-level, rare, or a named boss. Same-band elite is keepaway."""
     if not mob or not mob.get("hostile"):
         return False
     if mob.get("kind") not in ("mob", "npc"):
         return False
+    if is_boss(mob):
+        return True
     rare, _elite = template_flags(mob)
     return is_overlevel(mob, player_level) or rare
 
@@ -1063,6 +1183,8 @@ def is_hunt_mob(mob, player_level=None):
     if mob.get("kind") not in ("mob", "npc"):
         return False
     if not mob.get("hostile"):
+        return False
+    if is_dummy_mob(mob) or is_boss(mob):
         return False
     if not hunt_name_match(mob):
         return False
@@ -1695,6 +1817,10 @@ def pick_isolated(name_sub=None, level=None, min_level=None, max_level=None, min
         skip = None
         if not h.get("hostile"):
             skip = "friendly"
+        elif is_dummy_mob(h):
+            skip = "dummy"
+        elif is_boss(h):
+            skip = "boss"
         elif not is_hunt_mob(h, player_level):
             rare, elite = template_flags(h)
             if rare:

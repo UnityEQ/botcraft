@@ -773,11 +773,15 @@ def loop():
                     attack(False)
                 except Exception:
                     pass
-                try:
-                    activate_game()
-                except Exception:
-                    pass
-                time.sleep(3)
+                # Evaluate timeouts mean the tab is busy, not gone. Rebinding
+                # storms another timeout and looks like the character vanished.
+                msg = str(err).lower()
+                if "timed out" not in msg and "timeout" not in msg:
+                    try:
+                        activate_game()
+                    except Exception:
+                        pass
+                time.sleep(2)
     except KeyboardInterrupt:
         print("STOP interrupted")
         raise SystemExit(130)
