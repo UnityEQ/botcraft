@@ -13,6 +13,7 @@ from pathlib import Path
 CINDERBOLT = "fireball"
 RIMELANCE = "frostbolt"
 ICEBIND = "frost_nova"
+BLINK = "blink"
 BLAZING_BARRIER = "blazing_barrier"
 MANTLE = "frost_armor"
 INSIGHT = "arcane_intellect"
@@ -53,10 +54,14 @@ PULL_NEAR_YARDS = 42.0
 PULL_FAR_YARDS = 55.0
 # A pull never walks farther than this toward home. Bigger = stale/wrong xyz.
 PULL_HOME_MAX = 28.0
-# Sprint this far from the pack so they leash. Then walk home.
-FLEE_AWAY_YARDS = 40.0
-# After a flee we may be 40y+ out. Walking this far home is still the start stamp.
-FLEE_HOME_MAX = 80.0
+# Keep running at least this far so we are outside the 20y detect clamp.
+FLEE_MIN_YARDS = 22.0
+# Only keep sprinting this far if they have not dropped yet.
+FLEE_AWAY_YARDS = 32.0
+# Hard cap so a long chase does not cross the map.
+FLEE_HOME_MAX = 56.0
+# aiState values that mean the NPC is no longer chasing us.
+_FLEE_RETURN_AI = frozenset(("idle", "wander", "return", "evade", "reset", "leash", "home"))
 MELEE_RANGE = 6.0
 # Pack spacing. Neighbors inside this range disqualify the pull.
 ISOLATION_MIN = 5.0
@@ -71,6 +76,10 @@ NORMAL_KEEP = 10.0
 DANGER_KEEP = 22.0
 # Never open a pull below this fraction of max HP.
 MIN_PULL_HP_FRAC = 0.9
+# Cloth cannot finish a hard cast below this. Run, do not tank.
+FLEE_HP_FRAC = 0.55
+# Do not sit inside the 20y aggro clamp.
+SIT_CLEAR_YARDS = 24.0
 # Hunt band: player-7 through player+1.
 HUNT_LEVEL_ABOVE = 1
 HUNT_LEVEL_BELOW = 7
@@ -819,7 +828,12 @@ def _snapshot_raw():
       facing: e.facing ?? null,
       targetId: e.targetId || null,
       aggroTargetId: e.aggroTargetId || null,
-      inCombat: !!e.inCombat
+      inCombat: !!e.inCombat,
+      aiState: e.aiState || null,
+      evadeEpoch: e.evadeEpoch || 0,
+      chaseStall: e.chaseStall || 0,
+      vx: Math.round((e.vx || 0) * 100) / 100,
+      vz: Math.round((e.vz || 0) * 100) / 100
     });
   });
   ents.sort((a, b) => a.dist - b.dist);
@@ -865,6 +879,7 @@ def _snapshot_raw():
     })),
     autoAttack: !!p.autoAttack,
     inCombat: !!p.inCombat,
+    combatExitHoldUntil: p.combatExitHoldUntil || 0,
     gcdRemaining: Math.round((p.gcdRemaining || 0) * 100) / 100,
     castingAbility: p.castingAbility || null,
     castRemaining: Math.round((p.castRemaining || 0) * 100) / 100,
@@ -973,7 +988,12 @@ def entity(eid):
     facing: e.facing ?? null,
     targetId: e.targetId || null,
     aggroTargetId: e.aggroTargetId || null,
-    inCombat: !!e.inCombat
+    inCombat: !!e.inCombat,
+    aiState: e.aiState || null,
+    evadeEpoch: e.evadeEpoch || 0,
+    chaseStall: e.chaseStall || 0,
+    vx: Math.round((e.vx || 0) * 100) / 100,
+    vz: Math.round((e.vz || 0) * 100) / 100
   }};
 }})()
 """
@@ -1143,6 +1163,66 @@ def should_flee(mob, player_level, attacker_count=1):
     return flee_reason(mob, player_level, attacker_count) is not None
 
 
+def hp_frac(s):
+    mx = (s or {}).get("maxHp") or 0
+    if mx <= 0:
+        return 0.0
+    return float((s.get("hp") or 0)) / float(mx)
+
+
+def close_hostiles(s, radius=SIT_CLEAR_YARDS):
+    """Living hostiles inside radius, nearest first."""
+    s = s or snapshot()
+    out = [h for h in living_hostiles(s) if (h.get("dist") or 99) <= radius]
+    out.sort(key=lambda e: (e.get("dist") or 99))
+    return out
+
+
+def hostiles_near_point(s, x, z, radius=SIT_CLEAR_YARDS):
+    """Living hostiles near a world point (used to test if the stamp is a camp)."""
+    s = s or snapshot()
+    out = []
+    for h in living_hostiles(s):
+        if h.get("x") is None or h.get("z") is None:
+            continue
+        if dist(h["x"], h["z"], x, z) <= radius:
+            out.append(h)
+    out.sort(key=lambda e: dist(e["x"], e["z"], x, z))
+    return out
+
+
+def should_reset(s, aggro=None):
+    """True if standing to fight will get us killed."""
+    if not s or not s.get("ok") or s.get("dead"):
+        return True
+    if hp_frac(s) <= FLEE_HP_FRAC:
+        return True
+    aggro = attackers(s) if aggro is None else aggro
+    if not aggro:
+        return False
+    return should_flee(aggro[0], s.get("level") or 1, attacker_count=len(aggro))
+
+
+def reset_combat(s=None):
+    """Drop the pack: nova if it will not leech, then run away and come home."""
+    s = s or snapshot()
+    stop()
+    attack(False)
+    if s.get("ok") and not s.get("dead"):
+        aggro = attackers(s)
+        mob = aggro[0] if aggro else None
+        if (
+            mob
+            and knows_ability(ICEBIND)
+            and (s.get("mana") or 0) >= ICEBIND_COST
+            and (mob.get("dist") or 99) <= ICEBIND_RADIUS
+            and cooldown_remaining(ICEBIND, s) <= 0.08
+            and nova_is_safe(s, ignore_id=mob.get("id"))
+        ):
+            try_cast(ICEBIND)
+    return flee_to_safespot()
+
+
 def attackers(s=None):
     """Anyone actually hitting us: target, aggroTarget, combat-log, or melee while inCombat."""
     s = s or snapshot()
@@ -1208,6 +1288,10 @@ def fight_entity(eid, max_s=22.0):
             stop()
             attack(False)
             return s, mob, "dead"
+        if should_reset(s):
+            print("FLEE low_hp fight", json.dumps({"hp": s.get("hp"), "maxHp": s.get("maxHp"), "id": eid}))
+            reset_combat(s)
+            return snapshot(), entity(eid), "fled"
         s = ensure_hostile_target(eid, s)
         keep_autoattack(s)
         hold_safespot()
@@ -1255,9 +1339,13 @@ def defend(max_s=30.0):
             "templateId": mob.get("templateId"),
         }
         why_flee = flee_reason(mob, s.get("level"), attacker_count=len(aggro))
-        if why_flee:
-            print("FLEE", why_flee, json.dumps({**rec, "attackers": len(aggro), "player_level": s.get("level")}))
-            flee_to_safespot()
+        if why_flee or should_reset(s, aggro):
+            print(
+                "FLEE",
+                why_flee or "low_hp",
+                json.dumps({**rec, "attackers": len(aggro), "player_level": s.get("level"), "hp": s.get("hp")}),
+            )
+            reset_combat(s)
             return snapshot(), killed
         print("DEFEND", json.dumps(rec))
         remain = max(6.0, deadline - time.time())
@@ -1285,6 +1373,10 @@ def wait_or_defend(seconds):
         if not s.get("ok") or s.get("dead"):
             return s, []
         if attackers(s):
+            if should_reset(s):
+                print("FLEE wait_or_defend", json.dumps({"hp": s.get("hp"), "adds": len(attackers(s))}))
+                reset_combat(s)
+                return snapshot(), []
             return defend()
         time.sleep(0.12 if s.get("inCombat") else 0.3)
     return snapshot(), []
@@ -2361,11 +2453,50 @@ def back_off(from_x, from_z, yards=16.0, max_s=6.0):
     return snapshot()
 
 
+def _npc_returning(e):
+    """True when the NPC's AI has given up the chase (evade / walk home / idle)."""
+    return (e.get("aiState") or "").lower() in _FLEE_RETURN_AI
+
+
+def chasing_us(s=None):
+    """NPCs still pursuing this character. Empty means they dropped or are walking home."""
+    s = s or snapshot()
+    pid = s.get("id")
+    out = []
+    for e in s.get("ents") or []:
+        if e.get("dead") or e.get("kind") not in ("mob", "npc"):
+            continue
+        on_us = e.get("targetId") == pid or e.get("aggroTargetId") == pid
+        if not on_us:
+            continue
+        if _npc_returning(e):
+            continue
+        out.append(e)
+    out.sort(key=lambda e: (e.get("dist") or 99))
+    return out
+
+
+def aggro_dropped(s=None):
+    """True when nobody is chasing or targeting us. inCombat may still be sticky."""
+    s = s or snapshot()
+    if chasing_us(s):
+        return False
+    if attackers(s):
+        # attackers() includes a targetId we already classified as returning.
+        live = [e for e in attackers(s) if not _npc_returning(e)]
+        if live:
+            return False
+    return True
+
+
 def _threat_point(s):
     """Centroid of whoever is hitting us. None if combat is already clear."""
     aggro = [e for e in attackers(s) if e.get("x") is not None and e.get("z") is not None]
     if not aggro:
-        return None
+        chasers = [e for e in chasing_us(s) if e.get("x") is not None and e.get("z") is not None]
+        if not chasers:
+            return None
+        aggro = chasers
     return (
         sum(e["x"] for e in aggro) / len(aggro),
         sum(e["z"] for e in aggro) / len(aggro),
@@ -2373,8 +2504,24 @@ def _threat_point(s):
     )
 
 
-def _flee_heading(s, from_x, from_z):
-    """Face away from the pack. Do not run toward home — that is the camp."""
+def _flee_blockers(s):
+    """Hostiles we must not run into. Includes hunt-band trash, not just rares."""
+    out = []
+    seen = set()
+    for e in living_blockers(s, s.get("level") or 1):
+        if not e or e.get("id") in seen:
+            continue
+        if e.get("x") is None or e.get("z") is None:
+            continue
+        if (e.get("dist") or 99) > 48.0:
+            continue
+        seen.add(e.get("id"))
+        out.append(e)
+    return out
+
+
+def _flee_away_ang(s, from_x, from_z):
+    """Fallback: opposite the pack, or opposite home if we are standing on it."""
     dx = s["x"] - from_x
     dz = s["z"] - from_z
     if math.hypot(dx, dz) < 1.5:
@@ -2384,17 +2531,54 @@ def _flee_heading(s, from_x, from_z):
             if math.hypot(hx, hz) > 1.0:
                 return face_to(s["x"] + hx, s["z"] + hz, s["x"], s["z"])
         return s.get("facing") or 0.0
-    threat_ang = face_to(s["x"] + dx, s["z"] + dz, s["x"], s["z"])
-    if not SAFESPOT:
-        return threat_ang
-    d_home = dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"])
-    if d_home < 2.0:
-        return threat_ang
-    home_ang = face_to(SAFESPOT["x"], SAFESPOT["z"], s["x"], s["z"])
-    diff = abs((threat_ang - home_ang + math.pi) % (2 * math.pi) - math.pi)
-    if diff < (math.pi / 3):
-        return face_to(s["x"] * 2 - SAFESPOT["x"], s["z"] * 2 - SAFESPOT["z"], s["x"], s["z"])
-    return threat_ang
+    return face_to(s["x"] + dx, s["z"] + dz, s["x"], s["z"])
+
+
+def _flee_heading(s, from_x, from_z):
+    """Pick the gap: away from the pack AND not through any other camp."""
+    player_level = s.get("level") or 1
+    away = _flee_away_ang(s, from_x, from_z)
+    chaser_ids = {e.get("id") for e in chasing_us(s)} | {e.get("id") for e in attackers(s)}
+    others = [h for h in _flee_blockers(s) if h.get("id") not in chaser_ids]
+    lookahead = 28.0
+    best_ang = away
+    best_score = None
+    for i in range(16):
+        ang = i * (math.pi / 8.0)
+        tx = s["x"] + math.sin(ang) * lookahead
+        tz = s["z"] + math.cos(ang) * lookahead
+        if others:
+            clear = path_clearance(s["x"], s["z"], tx, tz, others)
+            margin = path_margin(s["x"], s["z"], tx, tz, others, player_level)
+            end_near = min(dist(tx, tz, h["x"], h["z"]) for h in others)
+        else:
+            clear, margin, end_near = 99.0, 99.0, 99.0
+        align = math.cos(ang - away)
+        score = end_near * 2.6 + margin * 2.2 + clear * 0.4 + align * 6.0
+        if end_near < DANGER_KEEP:
+            score -= 35.0
+        if margin < 0:
+            score -= 28.0
+        if SAFESPOT:
+            d_home = dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"])
+            if d_home < 16.0:
+                home_ang = face_to(SAFESPOT["x"], SAFESPOT["z"], s["x"], s["z"])
+                if math.cos(ang - home_ang) > 0.5:
+                    score -= 18.0
+        if best_score is None or score > best_score:
+            best_score = score
+            best_ang = ang
+    return best_ang
+
+
+def _flee_line_clear(s, ang, yards=28.0):
+    """True if blinking/running this heading will not clip another camp."""
+    others = [h for h in _flee_blockers(s) if h.get("id") not in ({e.get("id") for e in chasing_us(s)} | {e.get("id") for e in attackers(s)})]
+    if not others:
+        return True
+    tx = s["x"] + math.sin(ang) * yards
+    tz = s["z"] + math.cos(ang) * yards
+    return path_margin(s["x"], s["z"], tx, tz, others, s.get("level") or 1) >= 8.0
 
 
 def flee_away(from_x=None, from_z=None, yards=None, max_s=16.0):
@@ -2402,10 +2586,40 @@ def flee_away(from_x=None, from_z=None, yards=None, max_s=16.0):
     yards = FLEE_AWAY_YARDS if yards is None else yards
     stop()
     attack(False)
+    s0 = snapshot()
+    if s0.get("ok") and not s0.get("dead") and snapshot_is_ours(s0):
+        threat0 = _threat_point(s0)
+        if threat0:
+            fx0, fz0 = threat0[0], threat0[1]
+        elif from_x is not None and from_z is not None:
+            fx0, fz0 = from_x, from_z
+        elif SAFESPOT:
+            fx0, fz0 = SAFESPOT["x"], SAFESPOT["z"]
+        else:
+            fx0, fz0 = s0["x"], s0["z"]
+        ang0 = _flee_heading(s0, fx0, fz0)
+        clear0 = _flee_line_clear(s0, ang0)
+        print(
+            "FLEE heading",
+            json.dumps(
+                {
+                    "ang": round(ang0, 2),
+                    "clear": clear0,
+                    "others": [
+                        {"id": h.get("id"), "name": h.get("name"), "dist": h.get("dist")}
+                        for h in _flee_blockers(s0)[:6]
+                    ],
+                }
+            ),
+        )
+        face(ang0)
+        if knows_ability(BLINK) and cooldown_remaining(BLINK, s0) <= 0.08 and clear0:
+            try_cast(BLINK)
     t0 = time.time()
     last = None
     last_pos_t = t0
     stuck_hits = 0
+    evade_seen = {}
     while time.time() - t0 < max_s:
         s = snapshot()
         if not s.get("ok") or s.get("dead"):
@@ -2428,15 +2642,53 @@ def flee_away(from_x=None, from_z=None, yards=None, max_s=16.0):
             n_at = 0
         d_threat = dist(s["x"], s["z"], from_x, from_z)
         d_home = home_dist(s)
-        if n_at == 0 and not s.get("inCombat") and d_threat >= min(yards, DANGER_KEEP):
-            stop()
-            return s
-        if n_at == 0 and d_threat >= yards + 8:
+        chasers = chasing_us(s)
+        evaded = set()
+        for e in list(chasers) + (attackers(s) or []):
+            eid = e.get("id")
+            if eid is None:
+                continue
+            ev = e.get("evadeEpoch") or 0
+            if eid not in evade_seen:
+                evade_seen[eid] = ev
+            elif ev > evade_seen[eid]:
+                evaded.add(eid)
+        if evaded:
+            chasers = [c for c in chasers if c.get("id") not in evaded]
+        dropped = (not chasers) and (aggro_dropped(s) or bool(evaded))
+        nearest = None
+        if chasers:
+            nearest = min((c.get("dist") or 99) for c in chasers)
+        elif n_at:
+            nearest = d_threat
+        # They dropped: stop only if we are also clear of every other camp.
+        nest = close_hostiles(s, FLEE_MIN_YARDS)
+        if dropped and d_threat >= FLEE_MIN_YARDS and not nest:
+            print(
+                "FLEE dropped",
+                json.dumps(
+                    {
+                        "dist": round(d_threat, 1),
+                        "nearest": None if nearest is None else round(nearest, 1),
+                        "inCombat": bool(s.get("inCombat")),
+                        "chasers": [
+                            {
+                                "id": c.get("id"),
+                                "name": c.get("name"),
+                                "ai": c.get("aiState"),
+                                "dist": c.get("dist"),
+                            }
+                            for c in chasers[:4]
+                        ],
+                    }
+                ),
+            )
             stop()
             return s
         if d_home is not None and d_home >= FLEE_HOME_MAX - 2.0:
             stop()
             return s
+        # Still on us, or still inside another camp: keep running through the gap.
         ang = _flee_heading(s, from_x, from_z)
         now = time.time()
         if last is not None:
@@ -2445,7 +2697,7 @@ def flee_away(from_x=None, from_z=None, yards=None, max_s=16.0):
                 stuck_hits += 1
                 last = s
                 last_pos_t = now
-                ang = ang + (math.pi / 2 if stuck_hits % 2 else -math.pi / 2)
+                ang = ang + (math.pi / 2 if stuck_hits % 2 else math.pi)
             elif moved >= 0.35:
                 stuck_hits = 0
                 last = s
@@ -2502,7 +2754,8 @@ def flee_to_safespot(stop_at=5.0, max_s=24.0):
         s = flee_away(fx, fz, yards=FLEE_AWAY_YARDS, max_s=away_s)
         if not s.get("ok") or s.get("dead"):
             return s
-        # Wait for the combat lock. Do not defend — that tanks the pack.
+        # They dropped, or the sprint timed out. Wait for the sticky combat lock.
+        # Do not defend — that tanks the pack.
         t0 = time.time()
         picked_up = False
         while time.time() - t0 < 8.0:
@@ -2510,10 +2763,12 @@ def flee_to_safespot(stop_at=5.0, max_s=24.0):
             if not s.get("ok") or s.get("dead"):
                 stop()
                 return s
-            if attackers(s):
+            if chasing_us(s) or (attackers(s) and not aggro_dropped(s)):
                 picked_up = True
                 break
-            if not s.get("inCombat"):
+            if aggro_dropped(s) and not s.get("inCombat"):
+                break
+            if aggro_dropped(s) and (s.get("combatExitHoldUntil") or 0) <= 0:
                 break
             time.sleep(0.2)
         if picked_up:
@@ -2622,7 +2877,11 @@ def wait_out_of_combat(timeout=14.0, settle=None):
         if not s.get("ok") or s.get("dead"):
             return s
         if attackers(s):
-            s, _killed = defend()
+            if should_reset(s):
+                print("FLEE wait_combat", json.dumps({"hp": s.get("hp"), "adds": len(attackers(s))}))
+                s = reset_combat(s)
+            else:
+                s, _killed = defend()
             clear_since = None
             if s.get("dead"):
                 return s
@@ -2686,30 +2945,93 @@ def needs_recover(s, hp_frac=None, mana_frac=0.9):
     return False
 
 
+def _recover_clear_space(s, radius=SIT_CLEAR_YARDS, max_s=8.0):
+    """Step off the stamp so we do not sit inside aggro range."""
+    t0 = time.time()
+    while time.time() - t0 < max_s:
+        s = snapshot()
+        if not s.get("ok") or s.get("dead"):
+            stop()
+            return s
+        if attackers(s):
+            stop()
+            return reset_combat(s)
+        near = close_hostiles(s, radius)
+        if not near:
+            stop()
+            return s
+        if home_dist(s) is not None and home_dist(s) >= min(40.0, FLEE_HOME_MAX / 2):
+            stop()
+            return s
+        h = near[0]
+        ang = face_to(s["x"] * 2 - h["x"], s["z"] * 2 - h["z"], s["x"], s["z"])
+        move({"forward": True, "jump": True}, ang)
+        time.sleep(0.12)
+    stop()
+    return snapshot()
+
+
 def recover(hp_frac=0.95, mana_frac=0.9):
-    """Walk to the safespot, then Breadbind / Waterbind, then eat / drink until topped up."""
+    """Eat and drink in the clear. Never sit inside a camp, and never tank a wanderer."""
     s = snapshot()
+    if attackers(s) or (s.get("inCombat") and should_reset(s)):
+        s = reset_combat(s)
+        if s.get("dead"):
+            return s
     if not is_resting(s):
         stop()
         attack(False)
-        s = go_safespot(max_s=24.0, max_away=FLEE_HOME_MAX)
-        if s.get("dead"):
-            return s
+        home_hot = bool(SAFESPOT and hostiles_near_point(s, SAFESPOT["x"], SAFESPOT["z"], SIT_CLEAR_YARDS))
+        if not close_hostiles(s, SIT_CLEAR_YARDS) and not home_hot:
+            s = go_safespot(max_s=24.0, max_away=FLEE_HOME_MAX)
+            if s.get("dead"):
+                return s
     for _attempt in range(12):
         s = snapshot()
         if not s.get("ok") or s.get("dead"):
             return s
+        if attackers(s):
+            print("RECOVER flee aggro", json.dumps({"hp": s.get("hp"), "adds": len(attackers(s))}))
+            s = reset_combat(s)
+            if s.get("dead"):
+                return s
+            continue
         if not is_resting(s):
-            if SAFESPOT and dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) > 6.0:
-                s = go_safespot(max_s=24.0, max_away=FLEE_HOME_MAX)
+            hot = close_hostiles(s, SIT_CLEAR_YARDS)
+            if hot:
+                print(
+                    "RECOVER camp hot",
+                    json.dumps(
+                        [{"id": h.get("id"), "name": h.get("name"), "dist": h.get("dist")} for h in hot[:4]]
+                    ),
+                )
+                s = _recover_clear_space(s)
                 if s.get("dead"):
                     return s
+                continue
+            if SAFESPOT and dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) > 6.0:
+                home_hot = hostiles_near_point(s, SAFESPOT["x"], SAFESPOT["z"], SIT_CLEAR_YARDS)
+                if home_hot:
+                    print(
+                        "RECOVER skip hot home",
+                        json.dumps(
+                            [{"id": h.get("id"), "name": h.get("name")} for h in home_hot[:4]]
+                        ),
+                    )
+                else:
+                    s = go_safespot(max_s=24.0, max_away=FLEE_HOME_MAX, defend_on_aggro=False)
+                    if s.get("dead"):
+                        return s
+                    if attackers(s) or close_hostiles(s, SIT_CLEAR_YARDS):
+                        continue
             s = wait_out_of_combat(settle=0.6)
         if not s.get("ok") or s.get("dead"):
             return s
         if attackers(s):
             continue
         if s.get("inCombat") and not is_resting(s):
+            continue
+        if not is_resting(s) and close_hostiles(s, SIT_CLEAR_YARDS):
             continue
         need_food = s["hp"] < s["maxHp"] * hp_frac
         need_water = s["mana"] < s["maxMana"] * mana_frac
@@ -2725,7 +3047,7 @@ def recover(hp_frac=0.95, mana_frac=0.9):
             use_item(food)
         if water and not s.get("drinking"):
             use_item(water)
-        time.sleep(0.25)
+        time.sleep(0.15)
         err = hud_error()
         if is_combat_error(err):
             print("RECOVER blocked combat", err)
@@ -2747,7 +3069,8 @@ def recover(hp_frac=0.95, mana_frac=0.9):
                 return s
             if attackers(s):
                 stop()
-                s, _killed = defend()
+                print("RECOVER flee eat", json.dumps({"hp": s.get("hp"), "adds": len(attackers(s))}))
+                s = reset_combat(s)
                 if s.get("dead"):
                     return s
                 interrupted = True
@@ -2756,7 +3079,7 @@ def recover(hp_frac=0.95, mana_frac=0.9):
             mana_ok = s["mana"] >= s["maxMana"] * mana_frac
             if hp_ok and mana_ok:
                 return s
-            time.sleep(0.4)
+            time.sleep(0.15)
         if not interrupted:
             s = snapshot()
             if not needs_recover(s, hp_frac=hp_frac, mana_frac=mana_frac):

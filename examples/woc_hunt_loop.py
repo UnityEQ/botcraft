@@ -102,7 +102,7 @@ def hunt():
         if needs_recover(s, hp_frac=MIN_PULL_HP_FRAC, mana_frac=0.0):
             note("flee_low_hp_before_hunt", {"hp": s.get("hp"), "maxHp": s.get("maxHp"), "adds": len(aggro)})
             attack(False)
-            flee_to_safespot()
+            reset_combat(s)
             recover(hp_frac=0.95, mana_frac=0.9)
             return log
         note(
@@ -322,7 +322,7 @@ def hunt():
             [{"id": e.get("id"), "name": e.get("name"), "dist": e.get("dist")} for e in incoming],
         )
         attack(False)
-        flee_to_safespot()
+        reset_combat(s)
         recover(hp_frac=0.95, mana_frac=0.9)
         return log
 
@@ -376,7 +376,7 @@ def hunt():
                     [{"id": e.get("id"), "name": e.get("name"), "dist": e.get("dist")} for e in extras[:4]],
                 )
                 attack(False)
-                flee_to_safespot()
+                reset_combat(s)
                 recover(hp_frac=0.95, mana_frac=0.9)
                 return log
             mob = entity(wid)
@@ -390,7 +390,7 @@ def hunt():
                     [{"id": h.get("id"), "name": h.get("name"), "dist": h.get("dist")} for h in pack[:4]],
                 )
                 attack(False)
-                flee_to_safespot()
+                reset_combat(s)
                 recover(hp_frac=0.95, mana_frac=0.9)
                 return log
             s = ensure_hostile_target(wid, s)
@@ -430,6 +430,12 @@ def hunt():
         if not mob or mob.get("dead"):
             note("wolf_dead")
             break
+        if should_reset(s):
+            note("flee_low_hp", {"hp": s.get("hp"), "maxHp": s.get("maxHp"), "wolf": mob.get("hp")})
+            attack(False)
+            reset_combat(s)
+            recover(hp_frac=0.95, mana_frac=0.9)
+            return log
         s = ensure_hostile_target(wid, s)
         incoming = [e for e in attackers(s) if e.get("id") != wid]
         if incoming:
@@ -445,7 +451,7 @@ def hunt():
                 },
             )
             attack(False)
-            flee_to_safespot()
+            reset_combat(s)
             recover(hp_frac=0.95, mana_frac=0.9)
             return log
         extras = [e for e in adds_on_us(s, ignore_id=wid, radius=ADD_ABORT_RANGE) if e.get("targetId") == s.get("id")]
@@ -459,7 +465,7 @@ def hunt():
                 },
             )
             attack(False)
-            flee_to_safespot()
+            reset_combat(s)
             recover(hp_frac=0.95, mana_frac=0.9)
             return log
         hold_safespot()
@@ -516,8 +522,8 @@ def hunt():
             [{"id": a.get("id"), "name": a.get("name"), "dist": a.get("dist"), "hp": a.get("hp")} for a in aggro],
         )
         attack(False)
-        if should_flee(aggro[0], s.get("level") or 1, attacker_count=len(aggro)) or len(aggro) >= 2:
-            flee_to_safespot()
+        if should_reset(s, aggro) or len(aggro) >= 2:
+            reset_combat(s)
             recover(hp_frac=0.95, mana_frac=0.9)
             return log
         s, killed = defend()
@@ -616,6 +622,7 @@ def check_after(round_i, log):
         "flee_adds",
         "flee_adds_during_cast",
         "flee_adds_or_low_hp",
+        "flee_low_hp",
         "flee_adds_on_kite",
         "flee_pack_at_home",
         "flee_after_fight",
@@ -683,7 +690,7 @@ def loop():
                     if needs_recover(s, hp_frac=MIN_PULL_HP_FRAC, mana_frac=0.0):
                         print("FLEE low hp before defend", s.get("hp"), "/", s.get("maxHp"))
                         attack(False)
-                        flee_to_safespot()
+                        reset_combat(s)
                         s = recover(hp_frac=0.95, mana_frac=0.9)
                     else:
                         print(
