@@ -34,6 +34,10 @@ do {
         if ($code -ne 0) { exit $code }
         break
     }
+    if ($code -eq 2) {
+        Write-Host "Hunt stopped: character died (exit $code)"
+        exit 2
+    }
     Write-Host "Hunt process exited code $code at $(Get-Date -Format 'HH:mm:ss') - restarting in 3s (Ctrl+C to stop)"
     Start-Sleep -Seconds 3
 } while ($true)

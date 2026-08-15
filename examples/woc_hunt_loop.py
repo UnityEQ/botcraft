@@ -1,5 +1,6 @@
 # Isolated hunts forever until you hit Ctrl+C.
-# Any aggressive mob at most player level + 1. Start position is the recover safespot.
+# Hunt-band hostiles (player-7..+1), or only HUNT_NAME if that is set.
+# Tag with Attack (1), kite home, then Cinderbolt + Blazing Barrier at the safespot.
 # Run: .\scripts\run.ps1 examples\woc_hunt_loop.py
 #
 # Uses whichever character is already in the World of ClaudeCraft tab.
@@ -40,6 +41,14 @@ _load_woc_lib()
 # 0 = no cap (default). Set WOC_HUNT_ROUNDS=8 to restore a fixed count.
 ROUNDS = int(os.environ.get("WOC_HUNT_ROUNDS", "0"))
 FAIL_STREAK_PAUSE = 8
+# Process exit code when the character dies. Watchdogs must not relaunch.
+DIED_EXIT = 2
+
+
+def stop_if_dead(s, where=""):
+    if s and s.get("dead"):
+        print("STOP died", where, json.dumps({"hp": s.get("hp"), "pos": [s.get("x"), s.get("z")]}))
+        raise SystemExit(DIED_EXIT)
 
 
 def hunt():
@@ -103,6 +112,22 @@ def hunt():
         note("skip_low_hp", {"hp": s["hp"], "maxHp": s["maxHp"]})
         return log
 
+    pack = [h for h in living_hostiles(s) if (h.get("dist") or 99) <= 14]
+    if len(pack) >= 2:
+        note(
+            "leave_pack",
+            [{"id": h.get("id"), "name": h.get("name"), "dist": h.get("dist")} for h in pack[:6]],
+        )
+        cx = sum(h["x"] for h in pack) / len(pack)
+        cz = sum(h["z"] for h in pack) / len(pack)
+        flee_from(cx, cz, yards=36, max_s=8)
+        if SAFESPOT:
+            go_safespot()
+        s = recover(hp_frac=0.95, mana_frac=0.9)
+        if s.get("dead"):
+            note("we_died", {"hp": s["hp"]})
+            return log
+
     s = ensure_buffs()
     note(
         "buffs",
@@ -116,6 +141,7 @@ def hunt():
     )
 
     player_level = s.get("level") or 1
+    min_level = hunt_min_level(player_level)
     max_level = hunt_max_level(player_level)
     note(
         "here",
@@ -127,8 +153,18 @@ def hunt():
     )
     nearby = radar_brief(s, kinds=("mob", "npc"), radius=160.0)
     note("radar", {"count": len(nearby), "npcs": nearby})
-    note("hunt_band", {"player_level": player_level, "max_mob_level": max_level})
-    pick, cands = pick_isolated(max_level=max_level, min_iso=ISOLATION_MIN, min_path=ISOLATION_MIN)
+    note(
+        "hunt_band",
+        {
+            "player_level": player_level,
+            "min_mob_level": min_level,
+            "max_mob_level": max_level,
+            "name": HUNT_NAME,
+        },
+    )
+    pick, cands = pick_isolated(
+        name_sub=HUNT_NAME, min_level=min_level, max_level=max_level, min_iso=ISOLATION_MIN, min_path=ISOLATION_MIN
+    )
     note(
         "candidates",
         [
@@ -142,6 +178,7 @@ def hunt():
                 "danger": c.get("danger"),
                 "mob_danger": c.get("mob_danger"),
                 "crowd": c.get("crowd"),
+                "leash": c.get("leash"),
                 "why": c.get("why"),
                 "hp": c["hp"],
                 "xyz": c.get("xyz") or xyz_of(c),
@@ -152,7 +189,7 @@ def hunt():
     )
     if not pick:
         note(
-            "no_safe_wolf",
+            "no_safe_target",
             [
                 {
                     "id": c["id"],
@@ -256,26 +293,6 @@ def hunt():
         note("arrived", {"dist": mob.get("dist"), "why": why, "wolf_xyz": xyz_of(mob), "me": [s.get("x"), s.get("y"), s.get("z")]})
 
     extras = adds_on_us(s, ignore_id=wid, radius=12)
-    crowd = nearby_hostiles(s, ignore_id=wid, radius=CROWD_RADIUS)
-    if mob:
-        crowd_at_mob = nearby_hostiles(s, origin=(mob["x"], mob["z"]), ignore_id=wid, radius=CROWD_RADIUS)
-    else:
-        crowd_at_mob = []
-    if len(crowd) > MAX_CROWD or len(crowd_at_mob) > MAX_CROWD:
-        note(
-            "abort_crowd",
-            {
-                "near_me": [{"id": e.get("id"), "name": e.get("name"), "dist": e.get("dist")} for e in crowd[:5]],
-                "near_mob": [
-                    {"id": e.get("id"), "name": e.get("name"), "dist": e.get("dist")} for e in crowd_at_mob[:5]
-                ],
-            },
-        )
-        if crowd:
-            back_off(crowd[0]["x"], crowd[0]["z"], yards=28, max_s=6)
-        elif mob:
-            back_off(mob["x"], mob["z"], yards=24, max_s=5)
-        return log
     dangers = danger_nearby(s, ignore_id=wid)
     if dangers:
         note(
@@ -296,10 +313,8 @@ def hunt():
         s, killed = defend()
         note("defended", {"killed": killed, "hp": s.get("hp")})
         return log
-    if extras or not mob or mob.get("dead"):
-        note("abort_crowded_on_approach", {"wolf": mob, "adds": extras})
-        if mob:
-            back_off(mob["x"], mob["z"], yards=22, max_s=5)
+    if not mob or mob.get("dead"):
+        note("wolf_died_before_pull")
         return log
     if mob["dist"] < MELEE_RANGE:
         note("too_close_backing_out", {"dist": mob["dist"]})
@@ -316,42 +331,86 @@ def hunt():
             back_off(mob["x"], mob["z"], yards=20, max_s=4)
         return log
 
-    ang = face_to(mob["x"], mob["z"], s["x"], s["z"])
-    face(ang)
-    s = ensure_hostile_target(wid, s)
-    time.sleep(0.08)
-    stop()
-    # 1 Attack on as soon as we have a target. Casts go through world.castAbility
-    # and skip the bar's start-attack-on-cast, so the script has to hold this.
-    attack(True)
-    spell, ok, err = press_damage(wid, mob, s)
+    # Tag with Attack (1) and run. Do not plant a Cinderbolt or Barrier in the camp.
+    s, tagged = tag_with_attack(wid)
     note(
-        "opener",
+        "tag_attack",
         {
-            "spell": spell,
-            "dist": mob["dist"],
-            "hp": mob["hp"],
-            "autoAttack": True,
-            "started": ok,
-            "err": err or None,
+            "tagged": tagged,
+            "dist": None if not mob else mob.get("dist"),
+            "autoAttack": s.get("autoAttack"),
         },
     )
-    # Plant through a 1.5s hard cast. Moving here cancels Cinderbolt / Rimelance.
-    if ok and spell in (CINDERBOLT, RIMELANCE):
-        t_cast = time.time()
-        while time.time() - t_cast < CINDERBOLT_CAST + 0.2:
-            keep_autoattack()
-            incoming = [e for e in attackers() if e.get("id") != wid]
-            if incoming:
-                break
-            time.sleep(0.1)
-    keep_autoattack()
-    incoming = [e for e in attackers(snapshot()) if e.get("id") != wid]
+    incoming = [e for e in attackers(s) if e.get("id") != wid]
     if incoming:
-        note("attacker_during_cast", [{"id": e.get("id"), "name": e.get("name"), "dist": e.get("dist")} for e in incoming])
+        note(
+            "flee_adds_during_cast",
+            [{"id": e.get("id"), "name": e.get("name"), "dist": e.get("dist")} for e in incoming],
+        )
+        attack(False)
+        flee_from(incoming[0]["x"], incoming[0]["z"], yards=42, max_s=9)
+        recover(hp_frac=0.95, mana_frac=0.9)
+        return log
+
+    used_barrier = False
+    bolts = 0
+    if SAFESPOT:
+        s = snapshot()
+        home_d = dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"])
+        if home_d > 8.0:
+            note("pull_home", {"from": [round(s["x"], 1), round(s["z"], 1)], "home": SAFESPOT, "dist": round(home_d, 1)})
+            s, why_home = kite_to_safespot(ignore_id=wid, stop_at=6.0, max_s=22.0)
+            note("pulled_home", {"why": why_home, "pos": [round(s.get("x") or 0, 1), round(s.get("z") or 0, 1)]})
+            if s.get("dead"):
+                note("we_died", {"hp": s.get("hp")})
+                stop()
+                attack(False)
+                return log
+            extras = [e for e in attackers(s) if e.get("id") != wid]
+            if extras or why_home == "adds":
+                note(
+                    "flee_adds_on_kite",
+                    [{"id": e.get("id"), "name": e.get("name"), "dist": e.get("dist")} for e in extras[:4]],
+                )
+                attack(False)
+                src = extras[0] if extras else s
+                flee_from(src.get("x") or s["x"], src.get("z") or s["z"], yards=42, max_s=9)
+                recover(hp_frac=0.95, mana_frac=0.9)
+                return log
+            mob = entity(wid)
+            if not mob or mob.get("dead"):
+                note("wolf_died_before_pull")
+                return log
+            pack = [h for h in living_hostiles(s) if h.get("id") != wid and (h.get("dist") or 99) <= 12]
+            if len(pack) >= 2:
+                note(
+                    "flee_pack_at_home",
+                    [{"id": h.get("id"), "name": h.get("name"), "dist": h.get("dist")} for h in pack[:4]],
+                )
+                attack(False)
+                flee_from(pack[0]["x"], pack[0]["z"], yards=36, max_s=8)
+                recover(hp_frac=0.95, mana_frac=0.9)
+                return log
+            s = ensure_hostile_target(wid, s)
+            face(face_to(mob["x"], mob["z"], s["x"], s["z"]))
+            stop()
+
+    # Fight at home: Cinderbolt, then Blazing Barrier.
+    ok_cinder, err_cinder, used_barrier, err5, s = home_cinder_then_barrier(wid)
+    note(
+        "home_opener",
+        {
+            "cinder": ok_cinder,
+            "cinder_err": err_cinder or None,
+            "barrier": used_barrier,
+            "barrier_err": err5 or None,
+        },
+    )
+    if ok_cinder:
+        bolts = 1
+    keep_autoattack()
 
     t0 = time.time()
-    bolts = 1 if ok else 0
     reon = False
     while time.time() - t0 < 16:
         s = snapshot()
@@ -368,47 +427,41 @@ def hunt():
         incoming = [e for e in attackers(s) if e.get("id") != wid]
         if incoming:
             note(
-                "attacker_joined",
+                "flee_adds",
                 {
                     "adds": [
                         {"id": e.get("id"), "name": e.get("name"), "dist": e.get("dist"), "hp": e.get("hp")}
                         for e in incoming
                     ],
                     "wolf": {"id": mob.get("id"), "hp": mob.get("hp"), "dist": mob.get("dist")},
+                    "hp": s.get("hp"),
                 },
             )
-            s, killed = defend()
-            note("defended", {"killed": killed, "hp": s.get("hp")})
-            if s.get("dead"):
-                note("we_died", {"hp": s["hp"]})
-                stop()
-                attack(False)
-                return log
-            break
-        extras = adds_on_us(s, ignore_id=wid, radius=ADD_ABORT_RANGE)
-        wanderers = nearby_hostiles(s, ignore_id=wid, radius=CROWD_RADIUS)
-        if extras or len(wanderers) > MAX_CROWD:
+            attack(False)
+            flee_from(incoming[0]["x"], incoming[0]["z"], yards=42, max_s=9)
+            recover(hp_frac=0.95, mana_frac=0.9)
+            return log
+        extras = [e for e in adds_on_us(s, ignore_id=wid, radius=ADD_ABORT_RANGE) if e.get("targetId") == s.get("id")]
+        if extras:
             note(
-                "abort_adds_or_crowd",
+                "flee_adds_or_low_hp",
                 {
                     "hp": s["hp"],
                     "adds": [{"id": e.get("id"), "name": e.get("name"), "dist": e.get("dist")} for e in extras[:4]],
-                    "crowd": [
-                        {"id": e.get("id"), "name": e.get("name"), "dist": e.get("dist")} for e in wanderers[:5]
-                    ],
                     "wolf": {"id": mob.get("id"), "hp": mob.get("hp"), "dist": mob.get("dist")},
                 },
             )
             attack(False)
-            leave = extras[0] if extras else wanderers[0]
-            back_off(leave["x"], leave["z"], yards=28, max_s=6)
+            flee_from(extras[0]["x"], extras[0]["z"], yards=42, max_s=9)
+            recover(hp_frac=0.95, mana_frac=0.9)
             return log
+        hold_safespot()
         if keep_autoattack(s) and not reon:
             reon = True
             note("autoattack_reon", {"dist": mob["dist"], "hp": mob["hp"]})
         hp = mob.get("hp") or 0
         if (not casting_or_gcd(s)) and pick_damage_spell(s, mob) and bolts < 4:
-            spell, ok, err = press_damage(wid, mob, s)
+            spell, ok, err = press_damage(wid, mob, s, planted=True)
             if ok:
                 bolts += 1
                 note(
@@ -420,6 +473,10 @@ def hunt():
                         "autoAttack": s.get("autoAttack"),
                     },
                 )
+                if spell == CINDERBOLT and not used_barrier:
+                    started5, err5, _s = after_first_cinderbolt()
+                    used_barrier = True
+                    note("bar5_blazing_barrier", {"started": started5, "err": err5 or None})
             else:
                 note("cast_blocked", {"spell": spell, "err": err, "dist": mob["dist"], "hp": hp})
         time.sleep(0.12)
@@ -441,13 +498,18 @@ def hunt():
         },
     )
 
-    # Anyone who jumped us during the fight stays on the to-kill list.
+    # A leftover attacker after the kill is a pack leech. Run, do not tank it.
     aggro = attackers(s)
     if aggro:
         note(
-            "defend_after_fight",
+            "flee_after_fight",
             [{"id": a.get("id"), "name": a.get("name"), "dist": a.get("dist"), "hp": a.get("hp")} for a in aggro],
         )
+        attack(False)
+        if should_flee(aggro[0], s.get("level") or 1, attacker_count=len(aggro)) or len(aggro) >= 2:
+            flee_from(aggro[0]["x"], aggro[0]["z"], yards=42, max_s=9)
+            recover(hp_frac=0.95, mana_frac=0.9)
+            return log
         s, killed = defend()
         note("defended", {"killed": killed, "hp": s.get("hp")})
         if s.get("dead"):
@@ -464,18 +526,7 @@ def hunt():
     else:
         note("skip_loot", {"adds": extras})
 
-    # Home before the next pull. Do not back off into the pack.
-    s = go_safespot()
-    note("safespot", {"pos": [s.get("x"), s.get("z")], "home": SAFESPOT})
-    if attackers(s):
-        note("defend_on_safespot", [{"id": a.get("id"), "name": a.get("name"), "dist": a.get("dist")} for a in attackers(s)])
-        s, killed = defend()
-        note("defended", {"killed": killed, "hp": s.get("hp")})
-        if s.get("dead"):
-            note("we_died", {"hp": s["hp"]})
-            return log
-        s = go_safespot()
-
+    # Conjure first (recover), then walk home to sit. Do not walk home first.
     recover()
     s = snapshot()
     note("done", {"hp": s["hp"], "mana": s["mana"], "xp": s["xp"], "pos": [s["x"], s["z"]]})
@@ -537,7 +588,7 @@ def check_after(round_i, log):
         return "low_hp", report
     if log_has(log, "wolf_dead"):
         return "kill", report
-    if log_has(log, "no_safe_wolf", "wolf_died_before_pull"):
+    if log_has(log, "no_safe_target", "no_safe_wolf", "wolf_died_before_pull"):
         return "no_target", report
     if log_has(
         log,
@@ -551,6 +602,13 @@ def check_after(round_i, log):
         "abort_danger_on_approach",
         "ran_past_wolf",
         "approach_timeout",
+        "flee_adds",
+        "flee_adds_during_cast",
+        "flee_adds_or_low_hp",
+        "flee_adds_on_kite",
+        "flee_pack_at_home",
+        "flee_after_fight",
+        "leave_pack",
     ):
         return "aborted", report
     return "other", report
@@ -600,20 +658,12 @@ def loop():
                     if killed:
                         kills += len(killed)
                         print("DEFENDED", json.dumps(killed))
-                if s.get("dead"):
-                    print("WAIT dead, 12s (rez to continue, Ctrl+C to stop)")
-                    last_rounds.append({"round": i, "outcome": "dead"})
-                    last_rounds = last_rounds[-12:]
-                    wait_or_defend(12)
-                    continue
+                stop_if_dead(s, "before_round")
                 max_hp = s.get("maxHp") or 1
                 if (s.get("hp") or 0) < max_hp * MIN_PULL_HP_FRAC:
                     print("RECOVER", s.get("hp"), "/", s.get("maxHp"))
                     s = recover(hp_frac=0.95, mana_frac=0.9)
-                    if s.get("dead"):
-                        print("WAIT died while recovering")
-                        wait_or_defend(12)
-                        continue
+                    stop_if_dead(s, "while_recovering")
                 log = hunt()
                 outcome, report = check_after(i, log)
                 report["outcome"] = outcome
@@ -623,9 +673,7 @@ def loop():
                     kills += 1
                     fail = 0
                 elif outcome == "dead":
-                    print("WAIT dead after hunt, 12s")
-                    wait_or_defend(12)
-                    fail = 0
+                    stop_if_dead({"dead": True, "hp": report.get("hp"), "x": (report.get("pos") or [None, None])[0], "z": (report.get("pos") or [None, None])[1]}, "after_hunt")
                 elif outcome == "stuck_moving":
                     print("UNSTICK")
                     stop()
@@ -633,8 +681,12 @@ def loop():
                 elif outcome == "low_hp":
                     s = recover(hp_frac=0.95, mana_frac=0.9)
                     fail += 1
+                elif outcome == "aborted":
+                    print("RECOVER after flee")
+                    s = recover(hp_frac=0.95, mana_frac=0.9)
+                    fail += 1
                 elif outcome == "no_target":
-                    print("WAIT no isolated target, 8s")
+                    print("WAIT no hunt target, 8s")
                     s, killed = wait_or_defend(8)
                     if killed:
                         kills += len(killed)
@@ -651,6 +703,7 @@ def loop():
                         kills += len(killed)
                     fail = 0
                 s, killed = wait_or_defend(1.2)
+                stop_if_dead(s, "between_rounds")
                 if killed:
                     kills += len(killed)
                     print("DEFENDED", json.dumps(killed))

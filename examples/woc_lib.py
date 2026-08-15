@@ -9,6 +9,7 @@ import time
 CINDERBOLT = "fireball"
 RIMELANCE = "frostbolt"
 ICEBIND = "frost_nova"
+BLAZING_BARRIER = "blazing_barrier"
 MANTLE = "frost_armor"
 INSIGHT = "arcane_intellect"
 BREADBIND = "conjure_food"
@@ -18,14 +19,15 @@ WATER = "spring_water"
 FOOD_PREFIXES = ("conjured_bread", "baked_bread")
 WATER_PREFIXES = ("conjured_water", "spring_water")
 
-# Action bar: 1 Attack, 2 Cinderbolt, 3 Rimelance, 4 Icebind.
-# Buffs live on 11/12. Combat DPS is 2-4.
-CINDERBOLT_COST = 30
-CINDERBOLT_CAST = 1.5
-RIMELANCE_COST = 25
-RIMELANCE_CAST = 1.5
+# Action bar: 1 Attack, 2 Cinderbolt, 3 Rimelance, 4 Icebind, 5 Blazing Barrier.
+# Buffs live on 11/12. Combat DPS is 2-5. Bar 5 is after the first Cinderbolt.
+CINDERBOLT_COST = 65
+CINDERBOLT_CAST = 2.5
+RIMELANCE_COST = 35
+RIMELANCE_CAST = 2.0
 ICEBIND_COST = 35
 ICEBIND_RADIUS = 10.0
+BLAZING_BARRIER_COST = 65
 # Rank-1 Cinderbolt is 16-25 + 2 DoT. Rimelance is 18-20. Don't spend 30 mana on a dying mob.
 BOLT_OVERKILL_HP = 22
 BOLT_THIRD_HP = 40
@@ -53,9 +55,13 @@ MAX_CROWD = 1
 NORMAL_KEEP = 10.0
 DANGER_KEEP = 22.0
 # Never open a pull below this fraction of max HP.
-MIN_PULL_HP_FRAC = 0.8
-# Always allow pulls at least this many levels above the player.
+MIN_PULL_HP_FRAC = 0.9
+# Hunt band: player-7 through player+1.
 HUNT_LEVEL_ABOVE = 1
+HUNT_LEVEL_BELOW = 7
+# Only pull this mob when set. Empty string = any hunt-band hostile.
+# To lock a camp later: HUNT_NAME = "Mire Prowler"
+HUNT_NAME = ""
 # A +1 mob is worth this many extra yards vs a same-level. Keeps pulls local
 # but prefers the best legal level among nearby targets.
 HUNT_LEVEL_YARDS = 18.0
@@ -63,6 +69,10 @@ HUNT_LEVEL_YARDS = 18.0
 
 def hunt_max_level(player_level):
     return (player_level or 1) + HUNT_LEVEL_ABOVE
+
+
+def hunt_min_level(player_level):
+    return max(1, (player_level or 1) - HUNT_LEVEL_BELOW)
 
 
 # xyz recorded when the hunt loop starts. Recover walks here to eat/drink.
@@ -73,6 +83,13 @@ def set_safespot(s=None):
     global SAFESPOT
     s = s or snapshot()
     if not s.get("ok"):
+        return None
+    pack = [h for h in living_hostiles(s) if (h.get("dist") or 99) <= 16]
+    if len(pack) >= 2:
+        print(
+            "SAFESPOT refused, standing in a pack",
+            json.dumps([{"name": h.get("name"), "dist": h.get("dist")} for h in pack[:6]]),
+        )
         return None
     SAFESPOT = {"x": float(s["x"]), "y": float(s.get("y") or 0), "z": float(s["z"])}
     print("SAFESPOT set", json.dumps(SAFESPOT))
@@ -114,6 +131,65 @@ def go_safespot(stop_at=5.0, max_s=28.0):
             continue
         break
     return s
+
+
+def kite_to_safespot(ignore_id=None, stop_at=6.0, max_s=22.0):
+    """After a tag, run home. The pull target may chase; a second aggro aborts."""
+    if not SAFESPOT:
+        return snapshot(), "no_home"
+    s = snapshot()
+    if not s.get("ok") or s.get("dead"):
+        return s, "dead" if s.get("dead") else "no_game"
+    if dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) <= stop_at:
+        stop()
+        return s, "already"
+    print(
+        "SAFESPOT kite",
+        json.dumps({"from": [round(s["x"], 1), round(s["z"], 1)], "to": SAFESPOT, "ignore": ignore_id}),
+    )
+    # Leave Attack (1) on so the tag swing is not cancelled. Do not plant here.
+    t0 = time.time()
+    last = s
+    last_pos_t = t0
+    stuck_hits = 0
+    while time.time() - t0 < max_s:
+        s = snapshot()
+        if not s.get("ok") or s.get("dead"):
+            stop()
+            return s, "dead"
+        extras = [e for e in attackers(s) if e.get("id") != ignore_id]
+        if extras:
+            stop()
+            return s, "adds"
+        if dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) <= stop_at:
+            stop()
+            return s, "ok"
+        hostiles = living_blockers(s, s.get("level") or 1)
+        wx, wz, _route = next_step_toward(
+            s, SAFESPOT["x"], SAFESPOT["z"], hostiles, ignore_id=ignore_id
+        )
+        ang = face_to(wx, wz, s["x"], s["z"])
+        now = time.time()
+        moved = dist(s["x"], s["z"], last["x"], last["z"]) if last else 1
+        stuck = (now - last_pos_t) > 0.45 and moved < 0.35
+        if stuck:
+            stuck_hits += 1
+            last = s
+            last_pos_t = now
+        elif moved >= 0.35:
+            stuck_hits = 0
+            last = s
+            last_pos_t = now
+        move({"forward": True, "jump": True if stuck else int((now - t0) * 8) % 10 == 0}, ang)
+        if stuck_hits >= 6:
+            j("window.__game.world.unstuck()")
+            stuck_hits = 0
+        time.sleep(0.12)
+    stop()
+    s = snapshot()
+    if dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) <= stop_at + 3.0:
+        return s, "ok"
+    return s, "timeout"
 
 
 def activate_game(retries=8):
@@ -407,13 +483,27 @@ def is_too_hard(mob, player_level):
     return bool(tmpl.get("rare") or tmpl.get("elite"))
 
 
+def hunt_name_match(mob, needle=None):
+    """True if mob is the configured hunt target. Underscore/space are the same."""
+    if needle is None:
+        needle = HUNT_NAME
+    needle = (needle or "").lower().replace("_", " ").strip()
+    if not needle:
+        return True
+    name = (mob.get("name") or "").lower().replace("_", " ")
+    tmpl = (mob.get("templateId") or "").lower().replace("_", " ")
+    return needle in name or needle in tmpl
+
+
 def is_hunt_mob(mob, player_level=None):
-    """Hostile, not rare/elite, and at most player + HUNT_LEVEL_ABOVE."""
+    """Hostile, not rare/elite, in the hunt band, and the named target if set."""
     if not mob or mob.get("dead"):
         return False
     if mob.get("kind") not in ("mob", "npc"):
         return False
     if not mob.get("hostile"):
+        return False
+    if not hunt_name_match(mob):
         return False
     if player_level is None:
         return True
@@ -422,7 +512,7 @@ def is_hunt_mob(mob, player_level=None):
     lv = mob.get("level")
     if lv is None:
         return True
-    return lv <= hunt_max_level(player_level)
+    return hunt_min_level(player_level) <= lv <= hunt_max_level(player_level)
 
 
 def is_danger(mob, player_level):
@@ -437,12 +527,20 @@ def is_danger(mob, player_level):
 
 
 def keepaway_for(mob, player_level):
+    """How far to stay from this mob.
+
+    Over-level: stay outside ~20y detection. A same-band elite (Captain
+    Verlan at player-2) only needs its own aggro bubble. Using DANGER_KEEP
+    (22y) on those elites marked every chapel bone as route_danger and
+    idled the loop while we were already in bolt range.
+    """
     if is_danger(mob, player_level):
         tmpl = mobs().get(mob.get("templateId") or "") or {}
         aggro = tmpl.get("aggroRadius")
-        if isinstance(aggro, (int, float)) and aggro > 0:
-            return max(DANGER_KEEP, float(aggro) + 4.0)
-        return DANGER_KEEP
+        aggro_keep = float(aggro) + 4.0 if isinstance(aggro, (int, float)) and aggro > 0 else 16.0
+        if (mob.get("level") or 1) > hunt_max_level(player_level):
+            return max(DANGER_KEEP, aggro_keep)
+        return aggro_keep
     return NORMAL_KEEP
 
 
@@ -482,9 +580,10 @@ def danger_nearby(s=None, ignore_id=None, player_level=None, radius=None):
 
 
 def should_flee(mob, player_level, attacker_count=1):
+    """Cloth cannot tank a pack. Two hostiles on us is always a run."""
     if is_danger(mob, player_level):
         return True
-    if attacker_count >= 2 and not is_hunt_mob(mob, player_level):
+    if attacker_count >= 2:
         return True
     return False
 
@@ -532,7 +631,7 @@ def under_attack(s=None):
 
 
 def fight_entity(eid, max_s=22.0):
-    """Target and kill one mob already on us. Does not abort when that mob is close."""
+    """Kill one mob already on us. Plant at the safespot — do not chase."""
     stop()
     target(eid)
     attack(True)
@@ -551,21 +650,21 @@ def fight_entity(eid, max_s=22.0):
             return s, mob, "dead"
         s = ensure_hostile_target(eid, s)
         keep_autoattack(s)
+        hold_safespot()
+        s = snapshot()
         ang = face_to(mob["x"], mob["z"], s["x"], s["z"])
         face(ang)
         d = mob.get("dist") or 0
         want = (not casting_or_gcd(s)) and pick_damage_spell(s, mob) and bolts < 4
-        if d > CAST_RANGE:
-            move({"forward": True, "jump": d > 18}, ang)
-        elif want:
-            spell, ok, err = press_damage(eid, mob, s)
+        if want:
+            spell, ok, err = press_damage(eid, mob, s, planted=True)
             if ok:
                 bolts += 1
                 print("CAST", json.dumps({"spell": spell, "dist": d, "hp": mob.get("hp")}))
+                if spell == CINDERBOLT and bolts == 1:
+                    after_first_cinderbolt()
             elif err:
                 print("CAST fail", json.dumps({"spell": spell, "err": err, "dist": d}))
-        elif d > MELEE_RANGE + 1.5:
-            move({"forward": True}, ang)
         else:
             stop()
         time.sleep(0.12)
@@ -770,6 +869,35 @@ def route_danger_clearance(ax, az, waypoints, hostiles, player_level, ignore_id=
     return best
 
 
+def route_clips_danger(ax, az, waypoints, hostiles, player_level, ignore_id=None):
+    """True if the walk line enters a danger mob's keepaway."""
+    cx, cz = ax, az
+    for wx, wz in waypoints:
+        for h in hostiles:
+            if ignore_id is not None and h.get("id") == ignore_id:
+                continue
+            if not is_danger(h, player_level):
+                continue
+            if _seg_dist(h["x"], h["z"], cx, cz, wx, wz) < keepaway_for(h, player_level):
+                return True
+        cx, cz = wx, wz
+    return False
+
+
+def danger_leash(mob, hostiles, player_level):
+    """Yards of slack to the nearest danger keepaway. Negative = inside the bubble."""
+    best = 999.0
+    for h in hostiles:
+        if h.get("id") == mob.get("id"):
+            continue
+        if not is_danger(h, player_level):
+            continue
+        slack = dist(mob["x"], mob["z"], h["x"], h["z"]) - keepaway_for(h, player_level)
+        if slack < best:
+            best = slack
+    return best
+
+
 def route_to(ax, az, bx, bz, hostiles, ignore_id=None, min_clear=10.0, offset=14.0, max_hops=4, player_level=1):
     """Walkpoints from A to B that bend around other NPC xyz instead of through them."""
     pts = []
@@ -902,10 +1030,10 @@ def pick_isolated(name_sub=None, level=None, min_level=None, max_level=None, min
     player_level = s.get("level") or 1
     hostiles = hostiles if hostiles is not None else living_hostiles(s)
     blockers = living_blockers(s, player_level)
-    needle = (name_sub or "").lower()
+    needle = name_sub if name_sub is not None else HUNT_NAME
     cands = []
     for h in hostiles:
-        if needle and needle not in (h.get("name") or "").lower() and needle not in (h.get("templateId") or "").lower():
+        if not hunt_name_match(h, needle):
             continue
         if not is_hunt_mob(h, player_level):
             continue
@@ -931,24 +1059,21 @@ def pick_isolated(name_sub=None, level=None, min_level=None, max_level=None, min
         danger = route_danger_clearance(s["x"], s["z"], route, blockers, player_level, ignore_id=h["id"])
         dest_danger, _ = nearest_danger_dist(dest_x, dest_z, blockers, player_level, ignore_id=h["id"])
         mob_danger, _ = nearest_danger_dist(h["x"], h["z"], blockers, player_level, ignore_id=h["id"])
-        # Isolation is the pull gate. Path only has to clear the same spacing.
-        # Danger only rejects walking *through* an over-level camp, not a
-        # hunt-band mob that happens to live 20y from town or a chapel.
+        # Isolation / path / dest_crowd are sort hints only. A packed camp
+        # is still a pull. Hard rejects are: walking *through* an elite or
+        # over-level keepaway, or the mob itself sitting inside one (pull
+        # will leech Captain Verlan). dest_danger used to compare against
+        # a flat 22y and rejected every chapel bone from our stand-off.
         crowd = crowd_around(h, hostiles, CROWD_RADIUS)
         dest_crowd = len(
             [o for o in hostiles if o.get("id") != h["id"] and dist(dest_x, dest_z, o["x"], o["z"]) <= CROWD_RADIUS]
         )
+        leash = danger_leash(h, blockers, player_level)
         why = None
-        if iso < min_iso:
-            why = "iso"
-        elif path < min_path:
-            why = "path"
-        elif min(danger, dest_danger) < DANGER_KEEP:
+        if route_clips_danger(s["x"], s["z"], route, blockers, player_level, ignore_id=h["id"]):
             why = "route_danger"
-        elif mob_danger < min_iso:
+        elif leash < 0:
             why = "on_danger"
-        elif crowd > MAX_CROWD or dest_crowd > MAX_CROWD:
-            why = "crowd"
         cands.append(
             {
                 **h,
@@ -957,6 +1082,7 @@ def pick_isolated(name_sub=None, level=None, min_level=None, max_level=None, min
                 "danger": round(min(danger, dest_danger), 2),
                 "mob_danger": round(mob_danger, 2),
                 "crowd": crowd,
+                "leash": round(leash, 2),
                 "why": why,
                 "stage": stage,
                 "route": [{"x": round(wx, 2), "z": round(wz, 2)} for wx, wz in route],
@@ -972,6 +1098,7 @@ def pick_isolated(name_sub=None, level=None, min_level=None, max_level=None, min
         key=lambda c: (
             -(c.get("why") is None),
             _hunt_score(c),
+            c.get("crowd") or 0,
             c["dist"],
             -((c.get("level") or 1)),
             -c["isolation"],
@@ -980,6 +1107,10 @@ def pick_isolated(name_sub=None, level=None, min_level=None, max_level=None, min
         )
     )
     good = [c for c in cands if c.get("why") is None]
+    if not good:
+        # Walk would clip an elite — still pull if the mob itself is not
+        # stacked on that elite. Never pick on_danger (social-aggro wipe).
+        good = [c for c in cands if c.get("why") != "on_danger"]
     return good[0] if good else None, cands
 
 
@@ -1062,27 +1193,89 @@ def is_los_error(err):
     return "line of sight" in t or "can't see" in t or "cannot see" in t
 
 
-def try_cast(ability_id, eid=None, wait=0.35):
+def is_busy_error(err):
+    t = (err or "").lower()
+    return (
+        "busy" in t
+        or "already casting" in t
+        or "not ready" in t
+        or "can't do that yet" in t
+        or "cannot do that yet" in t
+    )
+
+
+def is_casting(s=None):
+    s = s or snapshot()
+    return bool(s.get("castingAbility") or (s.get("castRemaining") or 0) > 0.05)
+
+
+def wait_until_ready(timeout=3.5, also_stop=True):
+    """Block until we are not mid-cast or on GCD. Moving/autoattack can also busy a press."""
+    if also_stop:
+        stop()
+    t0 = time.time()
+    s = snapshot()
+    while time.time() - t0 < timeout:
+        if not s.get("ok") or s.get("dead"):
+            return s
+        if not casting_or_gcd(s):
+            return s
+        time.sleep(0.05)
+        s = snapshot()
+    return s
+
+
+def try_cast(ability_id, eid=None, wait=0.4, retries=3):
     """Press a cast. Returns (started, error, snapshot).
 
-    The sim refuses LoS / range / facing *before* the cast starts, so a failed
-    bolt never sets castingAbility or spends mana. The HUD error is the signal.
+    Waits out an in-progress cast/GCD first. 'You are busy' retries instead of
+    giving up. Instants never set castingAbility, so aura/cooldown is success.
     """
-    if eid is not None:
-        ensure_hostile_target(eid)
-    clear_hud_error()
-    cast(ability_id, eid)
-    t0 = time.time()
     err = ""
-    while time.time() - t0 < wait:
-        s = snapshot()
-        if s.get("castingAbility") == ability_id or (s.get("castRemaining") or 0) > 0.08:
-            return True, "", s
-        err = hud_error()
+    s = snapshot()
+    for attempt in range(max(1, retries)):
+        s = wait_until_ready(timeout=3.5)
+        if not s.get("ok") or s.get("dead"):
+            return False, err or "dead", s
+        if eid is not None:
+            ensure_hostile_target(eid, s)
+        clear_hud_error()
+        had_aura = has_aura(s, ability_id)
+        cd_before = cooldown_remaining(ability_id, s)
+        cast(ability_id, eid)
+        t0 = time.time()
+        err = ""
+        while time.time() - t0 < wait:
+            s = snapshot()
+            if s.get("castingAbility") == ability_id or (s.get("castRemaining") or 0) > 0.08:
+                return True, "", s
+            if not had_aura and has_aura(s, ability_id):
+                return True, "", s
+            if cooldown_remaining(ability_id, s) > cd_before + 0.2:
+                return True, "", s
+            err = hud_error()
+            if err:
+                break
+            time.sleep(0.05)
+        if not err:
+            err = hud_error()
+        if is_busy_error(err) and attempt + 1 < retries:
+            print("CAST busy, retry", json.dumps({"spell": ability_id, "attempt": attempt + 1, "err": err}))
+            time.sleep(0.12)
+            continue
         if err:
-            return False, err, s
-        time.sleep(0.05)
-    return False, err or hud_error(), snapshot()
+            return False, err, snapshot()
+        # Instant with no HUD reject and no hard-cast flag still counts.
+        s = snapshot()
+        if not had_aura and has_aura(s, ability_id):
+            return True, "", s
+        if cooldown_remaining(ability_id, s) > cd_before + 0.2:
+            return True, "", s
+        if not is_casting(s) and not err and attempt + 1 < retries:
+            time.sleep(0.1)
+            continue
+        return False, err, s
+    return False, err, snapshot()
 
 
 def nudge_clear_los(tx, tz, attempt=0, yards=4.5, max_s=0.65):
@@ -1092,13 +1285,12 @@ def nudge_clear_los(tx, tz, attempt=0, yards=4.5, max_s=0.65):
     if not s.get("ok"):
         return s
     ang = face_to(tx, tz, s["x"], s["z"])
-    step = attempt % 3
+    # Never walk toward the mob. Forward chase is how we leave the safespot.
+    step = attempt % 2
     if step == 0:
         flags, move_ang = {"strafeLeft": True}, ang
-    elif step == 1:
-        flags, move_ang = {"strafeRight": True}, ang
     else:
-        flags, move_ang = {"forward": True, "jump": True}, ang
+        flags, move_ang = {"strafeRight": True}, ang
     move(flags, move_ang)
     t0 = time.time()
     sx, sz = s["x"], s["z"]
@@ -1186,6 +1378,17 @@ def is_rooted(eid):
     )
 
 
+def nova_is_safe(s=None, ignore_id=None, radius=ICEBIND_RADIUS):
+    """Icebind is a self-centered nova. Any other hostile in the ring gets aggro."""
+    s = s or snapshot()
+    for h in living_hostiles(s):
+        if ignore_id is not None and h.get("id") == ignore_id:
+            continue
+        if (h.get("dist") or 99) <= radius:
+            return False
+    return True
+
+
 def pick_damage_spell(s, mob):
     """Highest DPS from bars 2-4: Icebind only in melee, else Cinderbolt, else Rimelance."""
     if not mob or mob.get("dead"):
@@ -1194,12 +1397,14 @@ def pick_damage_spell(s, mob):
     hp = mob.get("hp") or 0
     d = mob.get("dist") or 99
     # Icebind is a 10y self-centered AoE. Only fire it when they are already
-    # in melee so the root actually lands.
+    # in melee so the root actually lands — and never when a packmate is
+    # inside the nova (that is what pulled the second bone and killed us).
     if (
         mana >= ICEBIND_COST
         and d <= MELEE_RANGE
         and cooldown_remaining(ICEBIND, s) <= 0.08
         and not is_rooted(mob["id"])
+        and nova_is_safe(s, ignore_id=mob.get("id"))
     ):
         return ICEBIND
     if mana >= CINDERBOLT_COST and hp > BOLT_OVERKILL_HP and d <= CAST_RANGE:
@@ -1209,13 +1414,29 @@ def pick_damage_spell(s, mob):
     return None
 
 
-def press_damage(eid, mob, s=None, max_los_tries=3):
+def hold_safespot(stop_at=4.0):
+    """Stay planted at home. If a LoS strafe drifted us, step back — never chase."""
+    s = snapshot()
+    if not s.get("ok") or s.get("dead"):
+        return s
+    if not SAFESPOT:
+        stop()
+        return s
+    if dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) <= stop_at:
+        stop()
+        return s
+    ang = face_to(SAFESPOT["x"], SAFESPOT["z"], s["x"], s["z"])
+    move({"forward": True}, ang)
+    return s
+
+
+def press_damage(eid, mob, s=None, max_los_tries=3, planted=True):
     """Cast the next 2-4 damage spell at eid. Returns (ability_id or None, started, error)."""
     s = s or snapshot()
     spell = pick_damage_spell(s, mob)
     if not spell:
         return None, False, ""
-    stop()
+    s = wait_until_ready(timeout=3.0)
     ensure_hostile_target(eid, s)
     face(face_to(mob["x"], mob["z"], s["x"], s["z"]))
     if spell == ICEBIND:
@@ -1223,6 +1444,72 @@ def press_damage(eid, mob, s=None, max_los_tries=3):
         return spell, started, err
     started, err, _s = cast_or_clear_los(spell, mob["x"], mob["z"], eid=eid, max_tries=max_los_tries)
     return spell, started, err
+
+
+def press_blazing_barrier(s=None):
+    """Bar 5. Instant self shield. Press after the first Cinderbolt of a pull."""
+    s = wait_until_ready(timeout=3.5)
+    if has_aura(s, BLAZING_BARRIER):
+        return False, "already", s
+    if cooldown_remaining(BLAZING_BARRIER, s) > 0.08:
+        return False, "cd", s
+    if (s.get("mana") or 0) < BLAZING_BARRIER_COST:
+        return False, "mana", s
+    started, err, s = try_cast(BLAZING_BARRIER)
+    return started, err, s
+
+
+def after_first_cinderbolt(s=None):
+    """Wait out the hard cast and GCD, then hit Blazing Barrier."""
+    s = wait_while_casting(timeout=CINDERBOLT_CAST + 1.6, abort_on_attack=False)
+    if not s.get("ok") or s.get("dead"):
+        return False, "dead" if s.get("dead") else "no_game", s
+    s = wait_until_ready(timeout=2.5)
+    started, err, s = press_blazing_barrier(s)
+    print("BAR5 blazing_barrier", json.dumps({"started": started, "err": err or None, "mana": s.get("mana")}))
+    return started, err, s
+
+
+def tag_with_attack(eid, timeout=0.55):
+    """Pull tag: bar 1 only. Plant just long enough for the wand/swing to fire, then the caller runs."""
+    s = snapshot()
+    mob = entity(eid)
+    if not mob or mob.get("dead"):
+        return s, False
+    stop()
+    s = ensure_hostile_target(eid, s)
+    face(face_to(mob["x"], mob["z"], s["x"], s["z"]))
+    attack(True)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        s = snapshot()
+        if any(e.get("id") == eid for e in attackers(s)):
+            return s, True
+        mob = entity(eid)
+        if mob and (mob.get("targetId") == s.get("id") or mob.get("aggroTargetId") == s.get("id")):
+            return s, True
+        time.sleep(0.04)
+    s = snapshot()
+    tagged = s.get("autoAttack") or any(e.get("id") == eid for e in attackers(s))
+    return s, bool(tagged)
+
+
+def home_cinder_then_barrier(eid):
+    """At the safespot: Cinderbolt, then Blazing Barrier. Never do this in the camp."""
+    stop()
+    s = wait_until_ready(timeout=2.5)
+    mob = entity(eid)
+    if not mob or mob.get("dead") or s.get("dead"):
+        return False, "gone", False, "", s
+    s = ensure_hostile_target(eid, s)
+    face(face_to(mob["x"], mob["z"], s["x"], s["z"]))
+    attack(True)
+    started, err, s = try_cast(CINDERBOLT, eid)
+    print("HOME cinderbolt", json.dumps({"started": started, "err": err or None}))
+    if not started:
+        return False, err, False, "", s
+    started5, err5, s = after_first_cinderbolt(s)
+    return True, err, started5, err5, s
 
 
 def casting_or_gcd(s=None):
@@ -1366,11 +1653,10 @@ def approach_entity(eid, stop_at=PULL_RANGE, max_s=16.0, add_radius=12.0):
         if not s.get("ok") or s.get("dead") or not mob or mob.get("dead"):
             stop()
             return s, mob, "gone"
-        extras = adds_on_us(s, ignore_id=eid, radius=add_radius)
-        if extras:
-            stop()
-            return s, mob, "adds"
-        if len(nearby_hostiles(s, ignore_id=eid, radius=CROWD_RADIUS)) > MAX_CROWD:
+        # Packmates standing nearby are not adds. Only abort if something
+        # actually aggroed us, or we walked into an elite/over-level bubble.
+        incoming = [e for e in attackers(s) if e.get("id") != eid]
+        if incoming:
             stop()
             return s, mob, "adds"
         dangers = danger_nearby(s, ignore_id=eid)
@@ -1494,20 +1780,24 @@ def first_item(s, prefixes):
     return None
 
 
-def wait_while_casting(timeout=4.0):
+def wait_while_casting(timeout=4.0, abort_on_attack=True):
+    """Wait until a hard cast finishes. Combat pulls must pass abort_on_attack=False
+    or the tagged mob makes this return mid-cast ('You are busy' on the next press)."""
     t0 = time.time()
     saw = False
     while time.time() - t0 < timeout:
         s = snapshot()
-        if not s.get("ok") or s.get("dead") or attackers(s):
+        if not s.get("ok") or s.get("dead"):
             stop()
             return s
-        if s.get("castingAbility"):
+        if abort_on_attack and attackers(s):
+            stop()
+            return s
+        if is_casting(s):
             saw = True
         elif saw:
             return s
-        time.sleep(0.1)
-    stop()
+        time.sleep(0.08)
     return snapshot()
 
 
@@ -1548,39 +1838,39 @@ def wait_out_of_combat(timeout=14.0, settle=None):
     return snapshot()
 
 
+def _try_conjure(spell):
+    started, err, s = try_cast(spell)
+    if is_combat_error(err):
+        print("CONJURE blocked combat", err)
+        s = wait_out_of_combat(settle=2.0)
+        if attackers(s) or s.get("inCombat") or s.get("dead"):
+            return s, False
+        started, err, s = try_cast(spell)
+    if started:
+        s = wait_while_casting((WATERBIND_CAST if spell == WATERBIND else BREADBIND_CAST) + 0.4)
+        return s, True
+    if err:
+        print("CONJURE fail", json.dumps({"spell": spell, "err": err}))
+    return snapshot(), False
+
+
 def conjure_rations(s, need_food, need_water):
-    """Waterbind / Breadbind when bags have no drink or food. Out of combat only."""
-    s = wait_out_of_combat()
+    """Waterbind / Breadbind as soon as combat has dropped. Do this before walking home."""
     if attackers(s) or s.get("inCombat") or s.get("dead"):
         return s
     if need_water and item_count(s, WATER_PREFIXES) < 1 and (s.get("mana") or 0) >= WATERBIND_COST:
         print("CONJURE waterbind")
-        started, err, s = try_cast(WATERBIND)
-        if is_combat_error(err):
-            print("CONJURE blocked combat", err)
-            s = wait_out_of_combat()
-            return s
-        if started:
-            s = wait_while_casting(WATERBIND_CAST + 0.4)
-        elif err:
-            print("CONJURE fail", json.dumps({"spell": WATERBIND, "err": err}))
+        s, _ok = _try_conjure(WATERBIND)
     if attackers(s) or s.get("inCombat") or s.get("dead"):
         return s
     if need_food and item_count(s, FOOD_PREFIXES) < 1 and (s.get("mana") or 0) >= BREADBIND_COST:
         print("CONJURE breadbind")
-        started, err, s = try_cast(BREADBIND)
-        if is_combat_error(err):
-            print("CONJURE blocked combat", err)
-            return wait_out_of_combat()
-        if started:
-            s = wait_while_casting(BREADBIND_CAST + 0.4)
-        elif err:
-            print("CONJURE fail", json.dumps({"spell": BREADBIND, "err": err}))
+        s, _ok = _try_conjure(BREADBIND)
     return snapshot()
 
 
 def recover(hp_frac=0.85, mana_frac=0.7):
-    """Walk to the start safespot, conjure if bags are empty, then eat / drink."""
+    """Walk to the safespot, then Breadbind / Waterbind, then eat / drink."""
     s = snapshot()
     if not is_resting(s):
         stop()
@@ -1593,7 +1883,11 @@ def recover(hp_frac=0.85, mana_frac=0.7):
         if not s.get("ok") or s.get("dead"):
             return s
         if not is_resting(s):
-            s = wait_out_of_combat()
+            if SAFESPOT and dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) > 6.0:
+                s = go_safespot()
+                if s.get("dead"):
+                    return s
+            s = wait_out_of_combat(settle=0.6)
         if not s.get("ok") or s.get("dead"):
             return s
         if attackers(s):

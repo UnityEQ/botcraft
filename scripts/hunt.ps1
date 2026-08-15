@@ -13,6 +13,10 @@ while ($true) {
     Write-Host "HUNT start $(Get-Date -Format 'HH:mm:ss')"
     & "$PSScriptRoot\run.ps1" $hunt
     $code = $LASTEXITCODE
+    if ($code -eq 2) {
+        Write-Host "HUNT stopped: character died"
+        exit 2
+    }
     Write-Host "HUNT exited code $code at $(Get-Date -Format 'HH:mm:ss') - restarting in 3s"
     Start-Sleep -Seconds 3
 }
