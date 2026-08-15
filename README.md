@@ -1,8 +1,8 @@
 # botcraft
 
-A [World of ClaudeCraft](https://worldofclaudecraft.com/) hunter that drives **your already-open Chrome tab**. It finds an isolated wolf, pulls with Cinderbolt, holds auto-attack, loots, eats/drinks, and repeats until you stop it.
+A [World of ClaudeCraft](https://worldofclaudecraft.com/) toolkit that drives **your already-open Chrome tab**. The hunt loop pulls hostiles and recovers at a safespot. A **separate** map overlay paints NPC squares on the world map.
 
-It uses **whoever is already in the world**. There is no hardcoded player name. Log in, pick your own character, walk into the world, then start the script.
+It uses **whoever is already in the world**. There is no hardcoded player name. Log in, pick your own character, walk into the world, then start a script.
 
 ## Requirements
 
@@ -100,7 +100,33 @@ $env:WOC_HUNT_ROUNDS = "8"
 - Pulls with Cinderbolt, holds Attack (1), extra bolts only if the wolf is still fat
 - Backs off, loots if nothing else is on you, then eats/drinks
 
-If you die, it waits ~12 seconds so you can rez, then continues. If it cannot find a safe wolf, it waits and retries.
+If you die, the hunt **exits** (code 2) and the watchdog does not relaunch. Rez, then start the hunt again. If it cannot find a target, it waits and retries.
+
+## Map overlay
+
+Independent of the hunt. Edit `examples\woc_map_npcs.py`, then run it to push the overlay into the live game tab.
+
+```powershell
+.\scripts\map.ps1
+```
+
+Or:
+
+```powershell
+.\scripts\run.ps1 examples\woc_map_npcs.py
+```
+
+Open the world map (`M`) if you do not see the squares. Re-run after a page reload. The hunt never installs this.
+
+Squares sit on living mobs and NPCs (your player arrow is unchanged) and follow zoom/pan. Hover a square for a herb-patch style tooltip: name, level, type, hostile/friendly, HP, distance.
+
+| Color | Relative to your level |
+|---|---|
+| Green | 5 or more levels below |
+| Blue | 1–4 levels below |
+| White | same level |
+| Yellow | 1 or 2 above |
+| Red | 3 or more above |
 
 ## Other scripts
 
@@ -126,6 +152,8 @@ print(page_info())
 | `scripts\check-setup.ps1` | PATH, Chrome, `browser-use --doctor` |
 | `scripts\stop-daemon.ps1` | Kill the daemon (next run will prompt Allow again) |
 | `scripts\run.ps1 <file>` | Run a Python file against the live tab |
+| `scripts\hunt.ps1` | Hunt loop with auto-restart (stops if you die) |
+| `scripts\map.ps1` | Install or refresh the world-map NPC overlay |
 
 ## Troubleshooting
 
