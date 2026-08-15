@@ -46,10 +46,17 @@ BUFF_REFRESH_REMAINING = 60
 CAST_RANGE = 30.0
 # Open the first bolt near max range. Do not walk into 20y to start a fight.
 PULL_RANGE = 27.0
-# How far from home we may step to tag. Then we kite back. Not a cross-map walk.
-PULL_LEASH = 14.0
+# How far from home we may step to tag. Then we kite back.
+PULL_LEASH = 24.0
+# Closest mob in this ring always wins. If that ring is empty, allow PULL_FAR.
+PULL_NEAR_YARDS = 42.0
+PULL_FAR_YARDS = 55.0
 # A pull never walks farther than this toward home. Bigger = stale/wrong xyz.
-PULL_HOME_MAX = 20.0
+PULL_HOME_MAX = 28.0
+# Sprint this far from the pack so they leash. Then walk home.
+FLEE_AWAY_YARDS = 40.0
+# After a flee we may be 40y+ out. Walking this far home is still the start stamp.
+FLEE_HOME_MAX = 80.0
 MELEE_RANGE = 6.0
 # Pack spacing. Neighbors inside this range disqualify the pull.
 ISOLATION_MIN = 5.0
@@ -382,7 +389,7 @@ def restamp_home_if_stale(s):
     return s
 
 
-def go_safespot(stop_at=5.0, max_s=16.0, max_away=None):
+def go_safespot(stop_at=5.0, max_s=16.0, max_away=None, defend_on_aggro=True):
     """Walk back to the start stamp. Refuses a long march to a stale/wrong xyz."""
     if not SAFESPOT:
         return snapshot()
@@ -410,6 +417,9 @@ def go_safespot(stop_at=5.0, max_s=16.0, max_away=None):
     attack(False)
     for _try in range(3):
         if attackers(s):
+            if not defend_on_aggro:
+                stop()
+                return s
             s, _killed = defend()
             if s.get("dead"):
                 return s
@@ -432,6 +442,9 @@ def go_safespot(stop_at=5.0, max_s=16.0, max_away=None):
             stop()
             return s
         if attackers(s):
+            if not defend_on_aggro:
+                stop()
+                return s
             continue
         break
     return s
@@ -1244,7 +1257,7 @@ def defend(max_s=30.0):
         why_flee = flee_reason(mob, s.get("level"), attacker_count=len(aggro))
         if why_flee:
             print("FLEE", why_flee, json.dumps({**rec, "attackers": len(aggro), "player_level": s.get("level")}))
-            flee_from(mob["x"], mob["z"], yards=40, max_s=8)
+            flee_to_safespot()
             return snapshot(), killed
         print("DEFEND", json.dumps(rec))
         remain = max(6.0, deadline - time.time())
@@ -1606,7 +1619,7 @@ def pick_isolated(name_sub=None, level=None, min_level=None, max_level=None, min
                 skip = "not_hunt"
         elif dest_is_foreign_home(h["x"], h["z"], who):
             skip = "other_camp"
-        elif SAFESPOT and dist(h["x"], h["z"], SAFESPOT["x"], SAFESPOT["z"]) > CAST_RANGE + PULL_LEASH:
+        elif SAFESPOT and dist(h["x"], h["z"], SAFESPOT["x"], SAFESPOT["z"]) > PULL_FAR_YARDS:
             skip = "far_from_home"
         if skip:
             cands.append({**h, "why": skip, "xyz": xyz_of(h), "isolation": 0, "path": 0, "danger": 0, "mob_danger": 0, "crowd": 0, "leash": 0, "stage": None, "route": []})
@@ -1641,6 +1654,7 @@ def pick_isolated(name_sub=None, level=None, min_level=None, max_level=None, min
             why = "route_danger"
         elif leash < 0:
             why = "on_danger"
+        d_home = dist(h["x"], h["z"], SAFESPOT["x"], SAFESPOT["z"]) if SAFESPOT else (h.get("dist") or 99)
         cands.append(
             {
                 **h,
@@ -1654,27 +1668,15 @@ def pick_isolated(name_sub=None, level=None, min_level=None, max_level=None, min
                 "stage": stage,
                 "route": [{"x": round(wx, 2), "z": round(wz, 2)} for wx, wz in route],
                 "xyz": xyz_of(h),
+                "d_home": round(d_home, 1),
+                "near": d_home <= PULL_NEAR_YARDS,
             }
         )
-    cands.sort(
-        key=lambda c: (
-            -(c.get("why") is None),
-            c.get("dist") or 99.0,
-            -((c.get("level") or 1)),
-            c.get("crowd") or 0,
-            -c["isolation"],
-            -c["path"],
-            -c["danger"],
-        )
-    )
-    hard = ("rare", "elite", "over_level", "friendly", "not_hunt", "name", "other_camp", "low_level", "high_level", "far_from_home")
-    good = [c for c in cands if c.get("why") is None]
-    if not good:
-        # Packed camp: still pull the closest legal mob. Do not idle.
-        good = [c for c in cands if c.get("why") not in hard]
-    if not good:
-        good = [c for c in cands if c.get("why") is None or c.get("why") in ("route_danger", "on_danger")]
-    return good[0] if good else None, cands
+    legal = [c for c in cands if c.get("why") is None or c.get("why") in ("route_danger", "on_danger")]
+    legal.sort(key=lambda c: (c.get("dist") or 99.0, -((c.get("level") or 1))))
+    near = [c for c in legal if c.get("near")]
+    pick = near[0] if near else (legal[0] if legal else None)
+    return pick, cands
 
 
 def move(flags, facing=None):
@@ -2359,26 +2361,185 @@ def back_off(from_x, from_z, yards=16.0, max_s=6.0):
     return snapshot()
 
 
-def flee_from(from_x, from_z, yards=40.0, max_s=8.0):
-    """Run away even if they are still hitting us. Used for rares / over-level."""
+def _threat_point(s):
+    """Centroid of whoever is hitting us. None if combat is already clear."""
+    aggro = [e for e in attackers(s) if e.get("x") is not None and e.get("z") is not None]
+    if not aggro:
+        return None
+    return (
+        sum(e["x"] for e in aggro) / len(aggro),
+        sum(e["z"] for e in aggro) / len(aggro),
+        len(aggro),
+    )
+
+
+def _flee_heading(s, from_x, from_z):
+    """Face away from the pack. Do not run toward home — that is the camp."""
+    dx = s["x"] - from_x
+    dz = s["z"] - from_z
+    if math.hypot(dx, dz) < 1.5:
+        if SAFESPOT:
+            hx = s["x"] - SAFESPOT["x"]
+            hz = s["z"] - SAFESPOT["z"]
+            if math.hypot(hx, hz) > 1.0:
+                return face_to(s["x"] + hx, s["z"] + hz, s["x"], s["z"])
+        return s.get("facing") or 0.0
+    threat_ang = face_to(s["x"] + dx, s["z"] + dz, s["x"], s["z"])
+    if not SAFESPOT:
+        return threat_ang
+    d_home = dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"])
+    if d_home < 2.0:
+        return threat_ang
+    home_ang = face_to(SAFESPOT["x"], SAFESPOT["z"], s["x"], s["z"])
+    diff = abs((threat_ang - home_ang + math.pi) % (2 * math.pi) - math.pi)
+    if diff < (math.pi / 3):
+        return face_to(s["x"] * 2 - SAFESPOT["x"], s["z"] * 2 - SAFESPOT["z"], s["x"], s["z"])
+    return threat_ang
+
+
+def flee_away(from_x=None, from_z=None, yards=None, max_s=16.0):
+    """Sprint away from the pack. Never walks toward the safespot."""
+    yards = FLEE_AWAY_YARDS if yards is None else yards
     stop()
     attack(False)
     t0 = time.time()
+    last = None
+    last_pos_t = t0
+    stuck_hits = 0
     while time.time() - t0 < max_s:
         s = snapshot()
         if not s.get("ok") or s.get("dead"):
             stop()
             return s
-        d = dist(s["x"], s["z"], from_x, from_z)
-        if d >= yards and not s.get("inCombat"):
+        if not snapshot_is_ours(s):
             stop()
             return s
-        if d >= yards + 8:
+        threat = _threat_point(s)
+        if threat:
+            from_x, from_z, n_at = threat
+        elif from_x is None or from_z is None:
+            if SAFESPOT:
+                from_x, from_z = SAFESPOT["x"], SAFESPOT["z"]
+            else:
+                stop()
+                return s
+            n_at = 0
+        else:
+            n_at = 0
+        d_threat = dist(s["x"], s["z"], from_x, from_z)
+        d_home = home_dist(s)
+        if n_at == 0 and not s.get("inCombat") and d_threat >= min(yards, DANGER_KEEP):
             stop()
             return s
-        ang = face_to(s["x"] * 2 - from_x, s["z"] * 2 - from_z, s["x"], s["z"])
+        if n_at == 0 and d_threat >= yards + 8:
+            stop()
+            return s
+        if d_home is not None and d_home >= FLEE_HOME_MAX - 2.0:
+            stop()
+            return s
+        ang = _flee_heading(s, from_x, from_z)
+        now = time.time()
+        if last is not None:
+            moved = dist(s["x"], s["z"], last["x"], last["z"])
+            if (now - last_pos_t) > 0.45 and moved < 0.35:
+                stuck_hits += 1
+                last = s
+                last_pos_t = now
+                ang = ang + (math.pi / 2 if stuck_hits % 2 else -math.pi / 2)
+            elif moved >= 0.35:
+                stuck_hits = 0
+                last = s
+                last_pos_t = now
+        else:
+            last = s
+            last_pos_t = now
         move({"forward": True, "jump": True}, ang)
         time.sleep(0.12)
+    stop()
+    return snapshot()
+
+
+def flee_from(from_x, from_z, yards=40.0, max_s=8.0):
+    """Run away even if they are still hitting us. Does not walk home."""
+    return flee_away(from_x, from_z, yards=yards, max_s=max_s)
+
+
+def flee_to_safespot(stop_at=5.0, max_s=24.0):
+    """Run away until the pack drops, then walk back to the start stamp."""
+    stop()
+    attack(False)
+    s = snapshot()
+    if not s.get("ok") or s.get("dead"):
+        return s
+    away_s = max(14.0, max_s)
+    home_s = max(16.0, max_s)
+    for attempt in range(3):
+        if not s.get("ok") or s.get("dead"):
+            return s
+        threat = _threat_point(s)
+        if threat:
+            fx, fz = threat[0], threat[1]
+            n_at = threat[2]
+        elif SAFESPOT:
+            fx, fz = SAFESPOT["x"], SAFESPOT["z"]
+            n_at = 0
+        else:
+            fx, fz = s["x"], s["z"]
+            n_at = 0
+        print(
+            "FLEE away",
+            json.dumps(
+                {
+                    "from": [round(fx, 1), round(fz, 1)],
+                    "me": [round(s.get("x") or 0, 1), round(s.get("z") or 0, 1)],
+                    "home": SAFESPOT,
+                    "adds": n_at,
+                    "hp": s.get("hp"),
+                    "attempt": attempt,
+                }
+            ),
+        )
+        s = flee_away(fx, fz, yards=FLEE_AWAY_YARDS, max_s=away_s)
+        if not s.get("ok") or s.get("dead"):
+            return s
+        # Wait for the combat lock. Do not defend — that tanks the pack.
+        t0 = time.time()
+        picked_up = False
+        while time.time() - t0 < 8.0:
+            s = snapshot()
+            if not s.get("ok") or s.get("dead"):
+                stop()
+                return s
+            if attackers(s):
+                picked_up = True
+                break
+            if not s.get("inCombat"):
+                break
+            time.sleep(0.2)
+        if picked_up:
+            continue
+        if SAFESPOT:
+            print(
+                "FLEE home",
+                json.dumps(
+                    {
+                        "from": [round(s.get("x") or 0, 1), round(s.get("z") or 0, 1)],
+                        "to": SAFESPOT,
+                        "owner": SAFESPOT_OWNER,
+                    }
+                ),
+            )
+            s = go_safespot(
+                stop_at=stop_at,
+                max_s=home_s,
+                max_away=FLEE_HOME_MAX,
+                defend_on_aggro=False,
+            )
+            if not s.get("ok") or s.get("dead"):
+                return s
+            if attackers(s):
+                continue
+        return s
     stop()
     return snapshot()
 
@@ -2531,7 +2692,7 @@ def recover(hp_frac=0.95, mana_frac=0.9):
     if not is_resting(s):
         stop()
         attack(False)
-        s = go_safespot()
+        s = go_safespot(max_s=24.0, max_away=FLEE_HOME_MAX)
         if s.get("dead"):
             return s
     for _attempt in range(12):
@@ -2540,7 +2701,7 @@ def recover(hp_frac=0.95, mana_frac=0.9):
             return s
         if not is_resting(s):
             if SAFESPOT and dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) > 6.0:
-                s = go_safespot()
+                s = go_safespot(max_s=24.0, max_away=FLEE_HOME_MAX)
                 if s.get("dead"):
                     return s
             s = wait_out_of_combat(settle=0.6)

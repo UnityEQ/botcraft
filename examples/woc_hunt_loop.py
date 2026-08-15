@@ -73,8 +73,6 @@ def hunt():
         activate_game()
         return log
     if SAFESPOT is None:
-        set_safespot(s, force=True)
-    if SAFESPOT is None:
         note("no_home")
         return log
     note(
@@ -104,7 +102,7 @@ def hunt():
         if needs_recover(s, hp_frac=MIN_PULL_HP_FRAC, mana_frac=0.0):
             note("flee_low_hp_before_hunt", {"hp": s.get("hp"), "maxHp": s.get("maxHp"), "adds": len(aggro)})
             attack(False)
-            go_safespot()
+            flee_to_safespot()
             recover(hp_frac=0.95, mana_frac=0.9)
             return log
         note(
@@ -228,7 +226,7 @@ def hunt():
         mob_from_home = dist(mob["x"], mob["z"], SAFESPOT["x"], SAFESPOT["z"])
 
     if SAFESPOT:
-        if mob_from_home is None or mob_from_home > CAST_RANGE + PULL_LEASH:
+        if mob_from_home is None or mob_from_home > PULL_FAR_YARDS:
             note(
                 "skip_mob_far_from_home",
                 {
@@ -324,7 +322,7 @@ def hunt():
             [{"id": e.get("id"), "name": e.get("name"), "dist": e.get("dist")} for e in incoming],
         )
         attack(False)
-        go_safespot(stop_at=5.0, max_s=16.0)
+        flee_to_safespot()
         recover(hp_frac=0.95, mana_frac=0.9)
         return log
 
@@ -378,7 +376,7 @@ def hunt():
                     [{"id": e.get("id"), "name": e.get("name"), "dist": e.get("dist")} for e in extras[:4]],
                 )
                 attack(False)
-                go_safespot()
+                flee_to_safespot()
                 recover(hp_frac=0.95, mana_frac=0.9)
                 return log
             mob = entity(wid)
@@ -392,7 +390,7 @@ def hunt():
                     [{"id": h.get("id"), "name": h.get("name"), "dist": h.get("dist")} for h in pack[:4]],
                 )
                 attack(False)
-                go_safespot()
+                flee_to_safespot()
                 recover(hp_frac=0.95, mana_frac=0.9)
                 return log
             s = ensure_hostile_target(wid, s)
@@ -447,7 +445,7 @@ def hunt():
                 },
             )
             attack(False)
-            go_safespot()
+            flee_to_safespot()
             recover(hp_frac=0.95, mana_frac=0.9)
             return log
         extras = [e for e in adds_on_us(s, ignore_id=wid, radius=ADD_ABORT_RANGE) if e.get("targetId") == s.get("id")]
@@ -461,7 +459,7 @@ def hunt():
                 },
             )
             attack(False)
-            go_safespot()
+            flee_to_safespot()
             recover(hp_frac=0.95, mana_frac=0.9)
             return log
         hold_safespot()
@@ -519,7 +517,7 @@ def hunt():
         )
         attack(False)
         if should_flee(aggro[0], s.get("level") or 1, attacker_count=len(aggro)) or len(aggro) >= 2:
-            go_safespot()
+            flee_to_safespot()
             recover(hp_frac=0.95, mana_frac=0.9)
             return log
         s, killed = defend()
@@ -644,19 +642,24 @@ def loop():
                     print("WAIT snapshot is", who or "?", "wanted", want)
                     time.sleep(2)
                     continue
-                if s0.get("ok"):
-                    stamp_start_home()
-                if SAFESPOT:
-                    print(
-                        "SAFESPOT locked",
-                        json.dumps(
-                            {
-                                "player": SAFESPOT_OWNER,
-                                "index": SAFESPOT_INDEX,
-                                "home": SAFESPOT,
-                            }
-                        ),
-                    )
+                if not s0.get("ok"):
+                    time.sleep(2)
+                    continue
+                home = stamp_start_home()
+                if not home or SAFESPOT is None:
+                    print("WAIT safespot not set, will not pull yet")
+                    time.sleep(2)
+                    continue
+                print(
+                    "SAFESPOT locked before pulls",
+                    json.dumps(
+                        {
+                            "player": SAFESPOT_OWNER,
+                            "id": SAFESPOT_ID,
+                            "home": SAFESPOT,
+                        }
+                    ),
+                )
                 break
             except KeyboardInterrupt:
                 raise
@@ -680,7 +683,7 @@ def loop():
                     if needs_recover(s, hp_frac=MIN_PULL_HP_FRAC, mana_frac=0.0):
                         print("FLEE low hp before defend", s.get("hp"), "/", s.get("maxHp"))
                         attack(False)
-                        go_safespot()
+                        flee_to_safespot()
                         s = recover(hp_frac=0.95, mana_frac=0.9)
                     else:
                         print(
