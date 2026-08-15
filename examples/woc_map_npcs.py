@@ -247,5 +247,6 @@ def apply_overlay():
 
 
 if not globals().get("_WOC_MAP_IMPORT"):
+    os.environ["WOC_HALT_ON_EXIT"] = "0"
     _load_woc_lib()
     apply_overlay()

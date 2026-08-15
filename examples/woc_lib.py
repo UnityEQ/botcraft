@@ -2,9 +2,13 @@
 # Drive window.__game — never leave a held W or controller.move without stop().
 # Binds to the character already in the tab (world.playerId). No player name filter.
 
+import atexit
 import json
 import math
+import os
+import signal
 import time
+from pathlib import Path
 
 CINDERBOLT = "fireball"
 RIMELANCE = "frostbolt"
@@ -19,8 +23,8 @@ WATER = "spring_water"
 FOOD_PREFIXES = ("conjured_bread", "baked_bread")
 WATER_PREFIXES = ("conjured_water", "spring_water")
 
-# Action bar: 1 Attack, 2 Cinderbolt, 3 Rimelance, 4 Icebind, 5 Blazing Barrier.
-# Buffs live on 11/12. Combat DPS is 2-5. Bar 5 is after the first Cinderbolt.
+# Fight buttons: 1 Attack, 3 Cinderbolt, 4 Icebind, 5 Blazing Barrier.
+# Do not press bar 2. Frostbolt is off the bar.
 CINDERBOLT_COST = 65
 CINDERBOLT_CAST = 2.5
 RIMELANCE_COST = 35
@@ -42,6 +46,10 @@ BUFF_REFRESH_REMAINING = 60
 CAST_RANGE = 30.0
 # Open the first bolt near max range. Do not walk into 20y to start a fight.
 PULL_RANGE = 27.0
+# How far from home we may step to tag. Then we kite back. Not a cross-map walk.
+PULL_LEASH = 14.0
+# A pull never walks farther than this toward home. Bigger = stale/wrong xyz.
+PULL_HOME_MAX = 20.0
 MELEE_RANGE = 6.0
 # Pack spacing. Neighbors inside this range disqualify the pull.
 ISOLATION_MIN = 5.0
@@ -62,9 +70,7 @@ HUNT_LEVEL_BELOW = 7
 # Only pull this mob when set. Empty string = any hunt-band hostile.
 # To lock a camp later: HUNT_NAME = "Mire Prowler"
 HUNT_NAME = ""
-# A +1 mob is worth this many extra yards vs a same-level. Keeps pulls local
-# but prefers the best legal level among nearby targets.
-HUNT_LEVEL_YARDS = 18.0
+# Closest legal mob wins. Do not walk past a nearer NPC for a higher level.
 
 
 def hunt_max_level(player_level):
@@ -75,44 +81,341 @@ def hunt_min_level(player_level):
     return max(1, (player_level or 1) - HUNT_LEVEL_BELOW)
 
 
-# xyz recorded when the hunt loop starts. Recover walks here to eat/drink.
+# Other characters' last-known camps (updated when each hunt starts). Never used as our home.
+SAFESPOTS = []
+# This hunt's home — stamped from the character's xyz when the script starts.
+# Per process. The other hunt cannot see or change these values.
 SAFESPOT = None
+SAFESPOT_OWNER = None
+SAFESPOT_INDEX = None
+SAFESPOT_ID = None
+# True after this process has issued a walk. Used to detect a stale first xyz.
+HOME_WALKED = False
+# Mid-fight only corrects a small drift. A far home is the other character.
+HOME_HOLD_YARDS = 12.0
+# Pull / recover never crosses the map to another character's camp.
+HOME_WALK_YARDS = 90.0
+# Treat an xyz this close to a listed row as that character's camp.
+HOME_MATCH_YARDS = 40.0
+# Tab this process owns. j() always evaluates here so another hunt cannot steal reads.
+BOUND_TID = None
 
 
-def set_safespot(s=None):
-    global SAFESPOT
-    s = s or snapshot()
-    if not s.get("ok"):
+def _safespot_path(name):
+    raw = (name or "").strip()
+    if not raw:
         return None
-    pack = [h for h in living_hostiles(s) if (h.get("dist") or 99) <= 16]
-    if len(pack) >= 2:
-        print(
-            "SAFESPOT refused, standing in a pack",
-            json.dumps([{"name": h.get("name"), "dist": h.get("dist")} for h in pack[:6]]),
-        )
+    safe = "".join(c for c in raw.lower() if c.isalnum() or c in "-_")
+    if not safe:
         return None
-    SAFESPOT = {"x": float(s["x"]), "y": float(s.get("y") or 0), "z": float(s["z"])}
-    print("SAFESPOT set", json.dumps(SAFESPOT))
+    root = Path(os.environ.get("LOCALAPPDATA") or ".") / "botcraft" / "safespots"
+    root.mkdir(parents=True, exist_ok=True)
+    return root / (safe + ".json")
+
+
+def wanted_player():
+    return (os.environ.get("WOC_PLAYER") or "").strip()
+
+
+def _name_key(name):
+    return (name or "").strip().lower()
+
+
+def snapshot_is_ours(s):
+    """True if this snapshot is the character this hunt process is pinned to."""
+    if not s or not s.get("ok"):
+        return False
+    who = (s.get("name") or "").strip()
+    want = wanted_player()
+    if want and who.lower() != want.lower():
+        return False
+    if SAFESPOT_OWNER and who and who.lower() != SAFESPOT_OWNER.lower():
+        return False
+    return True
+
+
+def listed_safespot(name):
+    """This character's row in SAFESPOTS. Never falls through to someone else's camp."""
+    want = _name_key(name) or _name_key(wanted_player())
+    if not want:
+        return None
+    idx_raw = (os.environ.get("WOC_SAFESPOT_INDEX") or "").strip()
+    if idx_raw.isdigit():
+        idx = int(idx_raw)
+        if 0 <= idx < len(SAFESPOTS):
+            row = dict(SAFESPOTS[idx])
+            row["_index"] = idx
+            owner = _name_key(row.get("player"))
+            if owner and owner != want:
+                print(
+                    "SAFESPOT index skipped",
+                    json.dumps({"index": idx, "row": row.get("player"), "want": want}),
+                )
+            else:
+                return row
+    for i, spot in enumerate(SAFESPOTS):
+        if _name_key(spot.get("player")) == want:
+            row = dict(spot)
+            row["_index"] = i
+            return row
+    return None
+
+
+def whose_listed_home(x, z, max_d=None):
+    """Which SAFESPOTS row is this xyz standing on?"""
+    limit = HOME_MATCH_YARDS if max_d is None else max_d
+    best = None
+    best_d = limit
+    for i, spot in enumerate(SAFESPOTS):
+        d = dist(x, z, spot["x"], spot["z"])
+        if d <= best_d:
+            best_d = d
+            row = dict(spot)
+            row["_index"] = i
+            row["_dist"] = d
+            best = row
+    return best
+
+
+def dest_is_foreign_home(x, z, who):
+    other = whose_listed_home(x, z)
+    if not other:
+        return None
+    if _name_key(other.get("player")) == _name_key(who):
+        return None
+    return other
+
+
+def load_safespot(name):
+    """This character's saved JSON only. Do not substitute another row or a stale listed camp."""
+    path = _safespot_path(name)
+    if not path or not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        owner = (data.get("player") or name or "").strip()
+        want = wanted_player()
+        if want and owner and owner.lower() != want.lower():
+            return None
+        foreign = dest_is_foreign_home(float(data["x"]), float(data["z"]), owner or name)
+        if foreign:
+            print(
+                "SAFESPOT file ignored, on other camp",
+                json.dumps({"file": owner, "other": foreign.get("player")}),
+            )
+            return None
+        return {
+            "x": float(data["x"]),
+            "y": float(data.get("y") or 0),
+            "z": float(data["z"]),
+            "player": owner or name,
+        }
+    except Exception:
+        return None
+
+
+def save_safespot(name, spot):
+    path = _safespot_path(name)
+    if not path or not spot:
+        return
+    rec = {"x": spot["x"], "y": spot.get("y") or 0, "z": spot["z"], "player": name}
+    path.write_text(json.dumps(rec), encoding="utf-8")
+
+
+def update_listed_home(who, spot):
+    """Keep this character's SAFESPOTS row in sync so others will not walk here."""
+    if not who or not spot:
+        return None
+    key = _name_key(who)
+    rec = {"player": who, "x": float(spot["x"]), "y": float(spot.get("y") or 0), "z": float(spot["z"])}
+    for i, row in enumerate(SAFESPOTS):
+        if _name_key(row.get("player")) == key:
+            SAFESPOTS[i] = rec
+            return i
+    SAFESPOTS.append(rec)
+    return len(SAFESPOTS) - 1
+
+
+def adopt_safespot(spot, owner, eid=None):
+    global SAFESPOT, SAFESPOT_OWNER, SAFESPOT_INDEX, SAFESPOT_ID
+    if not spot:
+        return None
+    who = (owner or spot.get("player") or wanted_player() or "").strip()
+    SAFESPOT = {"x": float(spot["x"]), "y": float(spot.get("y") or 0), "z": float(spot["z"])}
+    SAFESPOT_OWNER = who
+    SAFESPOT_ID = eid
+    SAFESPOT_INDEX = update_listed_home(who, SAFESPOT)
     return SAFESPOT
 
 
-def go_safespot(stop_at=5.0, max_s=28.0):
-    """Walk back to the start point. Used between pulls to eat and drink."""
+def home_dist(s):
+    if not SAFESPOT or not s or not s.get("ok"):
+        return None
+    return dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"])
+
+
+def refuse_home_walk(s, max_away, why):
+    """Stop a walk that would send this character off their start stamp."""
+    if not SAFESPOT:
+        return s, "no_home"
+    if not snapshot_is_ours(s):
+        print(
+            "SAFESPOT skip wrong player",
+            json.dumps({"name": s.get("name"), "want": wanted_player() or None, "owner": SAFESPOT_OWNER, "why": why}),
+        )
+        stop()
+        return s, "wrong_player"
+    if SAFESPOT_ID is not None and s.get("id") is not None and s.get("id") != SAFESPOT_ID:
+        print(
+            "SAFESPOT skip wrong id",
+            json.dumps({"id": s.get("id"), "home_id": SAFESPOT_ID, "name": s.get("name"), "why": why}),
+        )
+        stop()
+        return s, "wrong_player"
+    d = home_dist(s)
+    if d is not None and d > max_away:
+        print(
+            "SAFESPOT skip too far",
+            json.dumps(
+                {
+                    "from": [round(s["x"], 1), round(s["z"], 1)],
+                    "to": SAFESPOT,
+                    "dist": round(d, 1),
+                    "owner": SAFESPOT_OWNER,
+                    "index": SAFESPOT_INDEX,
+                    "why": why,
+                }
+            ),
+        )
+        stop()
+        return s, "too_far"
+    return s, None
+
+
+def set_safespot(s=None, force=False):
+    """Home is this character's feet right now. Call once when the hunt process starts."""
+    s = s or snapshot()
+    if not s.get("ok"):
+        return None
+    who = (s.get("name") or "").strip()
+    want = wanted_player()
+    if want and who.lower() != want.lower():
+        print("SAFESPOT refused, snapshot is", json.dumps({"name": who, "want": want}))
+        return None
+    if SAFESPOT is not None and not force:
+        print(
+            "SAFESPOT keep",
+            json.dumps({"player": SAFESPOT_OWNER, "index": SAFESPOT_INDEX, "home": SAFESPOT}),
+        )
+        return SAFESPOT
+    pack = [h for h in living_hostiles(s) if (h.get("dist") or 99) <= 16]
+    near = [
+        {"name": h.get("name"), "dist": h.get("dist"), "xyz": xyz_of(h)}
+        for h in pack[:4]
+    ]
+    if not adopt_safespot(s, who, eid=s.get("id")):
+        return None
+    print(
+        "SAFESPOT set",
+        json.dumps(
+            {
+                "player": who or None,
+                "id": s.get("id"),
+                "index": SAFESPOT_INDEX,
+                "home": SAFESPOT,
+                "from": "script_start",
+                "nearby": near,
+            }
+        ),
+    )
+    return SAFESPOT
+
+
+def stamp_start_home():
+    """Read xyz a few times after bind. The first CDP read after attach can be stale."""
+    stop()
+    time.sleep(0.35)
+    agreed = None
+    last = None
+    for i in range(6):
+        s = snapshot()
+        if not s.get("ok") or not snapshot_is_ours(s):
+            time.sleep(0.2)
+            continue
+        if last and dist(s["x"], s["z"], last["x"], last["z"]) <= 2.0:
+            agreed = s
+            break
+        last = s
+        print(
+            "SAFESPOT sample",
+            json.dumps({"n": i, "name": s.get("name"), "id": s.get("id"), "xyz": [s.get("x"), s.get("y"), s.get("z")]}),
+        )
+        time.sleep(0.25)
+    s = agreed or last
+    if not s or not snapshot_is_ours(s):
+        print("SAFESPOT wait, no stable read for", wanted_player() or "?")
+        return None
+    return set_safespot(s, force=True)
+
+
+def restamp_home_if_stale(s):
+    """If we have not walked yet but are already far from recorded home, the first xyz was wrong."""
+    global HOME_WALKED
+    if HOME_WALKED or not s or not s.get("ok"):
+        return s
+    d = home_dist(s)
+    if d is None or d <= 6.0:
+        return s
+    print(
+        "SAFESPOT restamp stale",
+        json.dumps(
+            {
+                "was": SAFESPOT,
+                "now": [round(s["x"], 2), round(s.get("y") or 0, 2), round(s["z"], 2)],
+                "dist": round(d, 1),
+                "name": s.get("name"),
+                "id": s.get("id"),
+            }
+        ),
+    )
+    set_safespot(s, force=True)
+    return s
+
+
+def go_safespot(stop_at=5.0, max_s=16.0, max_away=None):
+    """Walk back to the start stamp. Refuses a long march to a stale/wrong xyz."""
     if not SAFESPOT:
         return snapshot()
     s = snapshot()
     if not s.get("ok") or s.get("dead") or is_resting(s):
         return s
+    cap = PULL_HOME_MAX if max_away is None else max_away
+    s, why = refuse_home_walk(s, cap, "go")
+    if why:
+        return s
     if dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) <= stop_at:
         stop()
         return s
-    print("SAFESPOT walk", json.dumps({"from": [round(s["x"], 1), round(s["z"], 1)], "to": SAFESPOT}))
+    print(
+        "SAFESPOT walk",
+        json.dumps(
+            {
+                "from": [round(s["x"], 1), round(s["z"], 1)],
+                "to": SAFESPOT,
+                "owner": SAFESPOT_OWNER,
+                "index": SAFESPOT_INDEX,
+            }
+        ),
+    )
     attack(False)
     for _try in range(3):
         if attackers(s):
             s, _killed = defend()
             if s.get("dead"):
                 return s
+        s, why = refuse_home_walk(s, cap, "go_retry")
+        if why:
+            return s
         s = move_toward(
             SAFESPOT["x"],
             SAFESPOT["z"],
@@ -121,6 +424,7 @@ def go_safespot(stop_at=5.0, max_s=28.0):
             jump=True,
             abort_adds=False,
             abort_danger=False,
+            avoid=False,
         )
         if s.get("dead"):
             return s
@@ -140,35 +444,56 @@ def kite_to_safespot(ignore_id=None, stop_at=6.0, max_s=22.0):
     s = snapshot()
     if not s.get("ok") or s.get("dead"):
         return s, "dead" if s.get("dead") else "no_game"
+    s, why = refuse_home_walk(s, PULL_HOME_MAX, "kite")
+    if why:
+        return s, why
     if dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) <= stop_at:
         stop()
         return s, "already"
     print(
         "SAFESPOT kite",
-        json.dumps({"from": [round(s["x"], 1), round(s["z"], 1)], "to": SAFESPOT, "ignore": ignore_id}),
+        json.dumps(
+            {
+                "from": [round(s["x"], 1), round(s["z"], 1)],
+                "to": SAFESPOT,
+                "ignore": ignore_id,
+                "owner": SAFESPOT_OWNER,
+                "index": SAFESPOT_INDEX,
+            }
+        ),
     )
     # Leave Attack (1) on so the tag swing is not cancelled. Do not plant here.
     t0 = time.time()
     last = s
     last_pos_t = t0
+    last_d = dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"])
     stuck_hits = 0
+    wrong_way = 0
     while time.time() - t0 < max_s:
         s = snapshot()
         if not s.get("ok") or s.get("dead"):
             stop()
             return s, "dead"
-        extras = [e for e in attackers(s) if e.get("id") != ignore_id]
-        if extras:
+        if not snapshot_is_ours(s):
             stop()
-            return s, "adds"
-        if dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) <= stop_at:
+            return s, "wrong_player"
+        d = dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"])
+        if d <= stop_at:
             stop()
             return s, "ok"
-        hostiles = living_blockers(s, s.get("level") or 1)
-        wx, wz, _route = next_step_toward(
-            s, SAFESPOT["x"], SAFESPOT["z"], hostiles, ignore_id=ignore_id
-        )
-        ang = face_to(wx, wz, s["x"], s["z"])
+        if d > PULL_HOME_MAX:
+            stop()
+            return s, "too_far"
+        if last_d is not None and d > last_d + 0.4:
+            wrong_way += 1
+            if wrong_way >= 4:
+                stop()
+                return s, "wrong_way"
+        else:
+            wrong_way = 0
+        last_d = d
+        # Beeline home. Path-bending around packs is what ran us into the wild.
+        ang = face_to(SAFESPOT["x"], SAFESPOT["z"], s["x"], s["z"])
         now = time.time()
         moved = dist(s["x"], s["z"], last["x"], last["z"]) if last else 1
         stuck = (now - last_pos_t) > 0.45 and moved < 0.35
@@ -182,8 +507,8 @@ def kite_to_safespot(ignore_id=None, stop_at=6.0, max_s=22.0):
             last_pos_t = now
         move({"forward": True, "jump": True if stuck else int((now - t0) * 8) % 10 == 0}, ang)
         if stuck_hits >= 6:
-            j("window.__game.world.unstuck()")
-            stuck_hits = 0
+            stop()
+            return s, "stuck"
         time.sleep(0.12)
     stop()
     s = snapshot()
@@ -192,21 +517,92 @@ def kite_to_safespot(ignore_id=None, stop_at=6.0, max_s=22.0):
     return s, "timeout"
 
 
+def _tab_player_info(tid=None):
+    """Read the in-world character on this tab. tid avoids reading the wrong page."""
+    code = r"""
+(() => {
+  const g = window.__game;
+  if (!g || !g.world) return {ok: false, reason: 'no_game'};
+  const p = g.world.entities && g.world.entities.get(g.world.playerId);
+  if (!p) return {ok: false, reason: 'no_player'};
+  return {ok: true, name: p.name || '', level: p.level || null};
+})()
+"""
+    try:
+        if tid:
+            return js(code, target_id=tid) or {}
+        return j(code) or {}
+    except Exception as err:
+        return {"ok": False, "reason": type(err).__name__}
+
+
+def _bound_player_ok():
+    if not BOUND_TID:
+        return False
+    info = _tab_player_info(BOUND_TID)
+    if not info.get("ok"):
+        return False
+    want = wanted_player()
+    name = (info.get("name") or "").strip()
+    if want and name.lower() != want.lower():
+        return False
+    return True
+
+
 def activate_game(retries=8):
+    """Bind the ClaudeCraft tab. WOC_PLAYER pins a character when several tabs exist."""
+    global BOUND_TID
     last = None
+    want = wanted_player().lower()
+    if _bound_player_ok():
+        # Keep this hunt on its own tab. Scanning every round switch_tab's the other character.
+        try:
+            cdp("Target.activateTarget", targetId=BOUND_TID)
+        except Exception:
+            pass
+        install_combat_hook()
+        return BOUND_TID
     for attempt in range(max(1, retries)):
         try:
             tabs = list_tabs(include_chrome=False)
+            found = []
+            match = None
             for t in tabs:
                 url = (t.get("url") or "").lower()
-                if "claudecraft" in url:
-                    tid = t.get("targetId") or t.get("target_id")
+                if "claudecraft" not in url:
+                    continue
+                tid = t.get("targetId") or t.get("target_id")
+                if not tid:
+                    continue
+                info = _tab_player_info(tid)
+                name = (info.get("name") or "").strip()
+                label = name or info.get("reason") or "?"
+                found.append({"title": (t.get("title") or "")[:40], "player": label})
+                if not info.get("ok"):
+                    continue
+                if want and name.lower() != want:
+                    continue
+                match = (tid, name, url)
+                break
+            if match:
+                tid, name, url = match
+                try:
+                    switch_tab(tid)
+                except Exception:
                     cdp("Target.activateTarget", targetId=tid)
-                    install_combat_hook()
-                    return tid
-            last = RuntimeError("World of ClaudeCraft tab not found")
+                install_combat_hook()
+                BOUND_TID = tid
+                print("BOUND", json.dumps({"player": name or None, "want": want or None, "tab": url[:80]}))
+                return tid
+            if want:
+                last = RuntimeError(
+                    "WOC_PLAYER=%s not in any in-world ClaudeCraft tab (saw %s)" % (want, found or "none")
+                )
+            else:
+                last = RuntimeError("World of ClaudeCraft tab not found (saw %s)" % (found or "none"))
         except Exception as err:
             last = err
+        BOUND_TID = None
         time.sleep(1.5)
     raise RuntimeError(f"World of ClaudeCraft tab not found ({last})")
 
@@ -256,6 +652,8 @@ def j(code):
     last = None
     for attempt in range(5):
         try:
+            if BOUND_TID:
+                return js(code, target_id=BOUND_TID)
             return js(code)
         except Exception as err:
             last = err
@@ -282,22 +680,78 @@ def j(code):
 
 
 def stop():
-    j(
+    """Drop scripted movement so this tick stands still. Keyboard works again after this."""
+    return j(
         """
 (() => {
   const g = window.__game;
-  if (!g) return;
-  g.controller.stop();
-  g.input.autorun = false;
-  if (g.world && g.world.setMoveInput) {
-    g.world.setMoveInput({
-      forward: false, back: false, turnLeft: false, turnRight: false,
-      strafeLeft: false, strafeRight: false, jump: false, dive: false, surface: false
-    });
-  }
+  if (!g) return {ok: false};
+  try { if (g.input && typeof g.input.setAutorun === 'function') g.input.setAutorun(false); } catch (e) {}
+  try { if (g.input) g.input.autorun = false; } catch (e) {}
+  try { if (g.controller && typeof g.controller.stop === 'function') g.controller.stop(); } catch (e) {}
+  try { if (g.input && typeof g.input.clearControllerMoveInput === 'function') g.input.clearControllerMoveInput(); } catch (e) {}
+  try { if (g.input && typeof g.input.clearClickMove === 'function') g.input.clearClickMove(); } catch (e) {}
+  try {
+    if (g.world && g.world.setMoveInput) {
+      g.world.setMoveInput({
+        forward: false, back: false, turnLeft: false, turnRight: false,
+        strafeLeft: false, strafeRight: false, jump: false, dive: false, surface: false
+      });
+    }
+  } catch (e) {}
+  return {ok: true};
 })()
 """
     )
+
+
+_HALTED = False
+
+
+def halt_movement(reason="exit"):
+    """Stop autorun and give the keyboard back. Do not leave controllerMoveInput set."""
+    global _HALTED
+    if _HALTED:
+        return True
+    ok = False
+    try:
+        stop()
+        ok = True
+    except Exception as err:
+        print("HALT stop failed", reason, type(err).__name__, str(err)[:200])
+    try:
+        attack(False)
+    except Exception:
+        pass
+    if ok:
+        _HALTED = True
+        print("HALT", reason)
+    return ok
+
+
+def _on_stop_signal(signum, _frame):
+    halt_movement("signal_%s" % signum)
+    raise KeyboardInterrupt
+
+
+def _install_halt_hooks():
+    # Map overlay and other one-shot scripts must not halt on exit — that
+    # left controllerMoveInput set and blocked WASD. Hunt sets WOC_HALT_ON_EXIT=1.
+    flag = (os.environ.get("WOC_HALT_ON_EXIT") or "").strip().lower()
+    if flag not in ("1", "true", "yes"):
+        return
+    atexit.register(halt_movement, "atexit")
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _on_stop_signal)
+        except Exception:
+            pass
+
+
+_install_halt_hooks()
 
 
 def is_resting(s=None):
@@ -325,7 +779,7 @@ def xyz_of(e):
     return [round(e.get("x") or 0, 2), round(e.get("y") or 0, 2), round(e.get("z") or 0, 2)]
 
 
-def snapshot():
+def _snapshot_raw():
     return j(
         r"""
 (() => {
@@ -424,6 +878,67 @@ def snapshot():
     )
 
 
+def snapshot():
+    """Read this hunt's character only. A leaked snapshot from another tab walks us to their xyz."""
+    data = _snapshot_raw()
+    want = _name_key(wanted_player()) or _name_key(SAFESPOT_OWNER)
+    if not want:
+        return data or {"ok": False}
+    if data and data.get("ok") and _name_key(data.get("name")) == want:
+        return data
+    print(
+        "SNAPSHOT wrong player",
+        json.dumps({"name": (data or {}).get("name"), "want": want, "bound": bool(BOUND_TID)}),
+    )
+    if BOUND_TID:
+        try:
+            cdp("Target.activateTarget", targetId=BOUND_TID)
+        except Exception:
+            pass
+        data = _snapshot_raw()
+        if data and data.get("ok") and _name_key(data.get("name")) == want:
+            return data
+    try:
+        activate_game(retries=2)
+    except Exception:
+        pass
+    data = _snapshot_raw()
+    if data and data.get("ok") and _name_key(data.get("name")) == want:
+        return data
+    return {"ok": False, "reason": "wrong_player", "name": (data or {}).get("name")}
+
+
+def own_listed_home(s=None):
+    """Session start first. Listed coords are only a fallback, never another player."""
+    who = (s.get("name") if s else None) or wanted_player() or SAFESPOT_OWNER
+    if SAFESPOT and (not SAFESPOT_OWNER or not who or _name_key(SAFESPOT_OWNER) == _name_key(who)):
+        rec = dict(SAFESPOT)
+        rec["player"] = SAFESPOT_OWNER or who
+        rec["_index"] = SAFESPOT_INDEX
+        return rec
+    return listed_safespot(who)
+
+
+def standing_on_foreign_camp(s):
+    if not s or not s.get("ok"):
+        return None
+    who = s.get("name") or wanted_player() or SAFESPOT_OWNER
+    other = whose_listed_home(s["x"], s["z"])
+    if other and _name_key(other.get("player")) != _name_key(who):
+        return other
+    return None
+
+
+def away_from_own_home(s):
+    home = own_listed_home(s)
+    if not home or not s or not s.get("ok"):
+        return None
+    d = dist(s["x"], s["z"], home["x"], home["z"])
+    if d > HOME_WALK_YARDS:
+        return d
+    return None
+
+
 def entity(eid):
     return j(
         f"""
@@ -471,16 +986,29 @@ def mobs():
     return _MOBS
 
 
+def template_flags(mob):
+    tmpl = mobs().get((mob or {}).get("templateId") or "") or {}
+    return bool(tmpl.get("rare")), bool(tmpl.get("elite"))
+
+
+def is_overlevel(mob, player_level):
+    """True only when we know both levels and the mob is above the hunt band."""
+    if not player_level or player_level < 1:
+        return False
+    lv = (mob or {}).get("level")
+    if lv is None:
+        return False
+    return lv > hunt_max_level(player_level)
+
+
 def is_too_hard(mob, player_level):
-    """Named rares / elites / over-level packs will kill a low-HP caster."""
+    """Flee / do-not-open: over-level or rare. Same-band elite is keepaway, not a flee."""
     if not mob or not mob.get("hostile"):
         return False
     if mob.get("kind") not in ("mob", "npc"):
         return False
-    if (mob.get("level") or 1) > hunt_max_level(player_level):
-        return True
-    tmpl = mobs().get(mob.get("templateId") or "") or {}
-    return bool(tmpl.get("rare") or tmpl.get("elite"))
+    rare, _elite = template_flags(mob)
+    return is_overlevel(mob, player_level) or rare
 
 
 def hunt_name_match(mob, needle=None):
@@ -507,7 +1035,10 @@ def is_hunt_mob(mob, player_level=None):
         return False
     if player_level is None:
         return True
-    if is_too_hard(mob, player_level):
+    rare, elite = template_flags(mob)
+    if rare or elite:
+        return False
+    if is_overlevel(mob, player_level):
         return False
     lv = mob.get("level")
     if lv is None:
@@ -516,14 +1047,15 @@ def is_hunt_mob(mob, player_level=None):
 
 
 def is_danger(mob, player_level):
-    """Hostile over the hunt band, rare, or elite. Town vendors are not danger."""
+    """Pathing keepaway: over-level, rare, or elite. Hunt-band trash is not danger."""
     if not mob or mob.get("dead") or not mob.get("hostile"):
         return False
     if mob.get("kind") not in ("mob", "npc"):
         return False
     if is_hunt_mob(mob, player_level):
         return False
-    return is_too_hard(mob, player_level)
+    rare, elite = template_flags(mob)
+    return is_overlevel(mob, player_level) or rare or elite
 
 
 def keepaway_for(mob, player_level):
@@ -579,13 +1111,23 @@ def danger_nearby(s=None, ignore_id=None, player_level=None, radius=None):
     return out
 
 
-def should_flee(mob, player_level, attacker_count=1):
-    """Cloth cannot tank a pack. Two hostiles on us is always a run."""
-    if is_danger(mob, player_level):
-        return True
+def flee_reason(mob, player_level, attacker_count=1):
+    """Why we would run. Hunt-band trash and same-band elites are not 'too hard'."""
     if attacker_count >= 2:
-        return True
-    return False
+        return "pack"
+    if not mob:
+        return None
+    if is_overlevel(mob, player_level):
+        return "over_level"
+    rare, _elite = template_flags(mob)
+    if rare:
+        return "rare"
+    return None
+
+
+def should_flee(mob, player_level, attacker_count=1):
+    """Cloth cannot tank a pack or a rare. A single hunt-band NPC is a fight."""
+    return flee_reason(mob, player_level, attacker_count) is not None
 
 
 def attackers(s=None):
@@ -610,17 +1152,22 @@ def attackers(s=None):
             add(e)
     for hid in s.get("hitByIds") or []:
         add(by_id.get(hid))
-    # Names only while a live hit is on the hook. Stale "Forest Wolf hits you"
-    # lines stay in the 200-line combat log after the fight is over.
+    # Same-name camps (Bog Bloat, Restless Bones) must not count a neighbor
+    # as an add. Only attach a name hit if that mob is already on us.
     if s.get("hitByIds") and s.get("inCombat"):
+        hit_ids = set(s.get("hitByIds") or [])
         for name in s.get("hitByNames") or []:
             matches = [e for e in ents if (e.get("name") or "") == name and not e.get("dead")]
-            if matches:
-                add(min(matches, key=lambda e: e.get("dist") or 99))
-    if s.get("inCombat") and not out:
-        for h in living_hostiles(s):
-            if (h.get("dist") or 99) <= MELEE_RANGE + 2:
-                add(h)
+            on_us = [
+                e
+                for e in matches
+                if e.get("id") in hit_ids
+                or e.get("targetId") == pid
+                or e.get("aggroTargetId") == pid
+            ]
+            if on_us:
+                for e in on_us:
+                    add(e)
     out.sort(key=lambda e: (e.get("dist") or 99, e.get("hp") or 0))
     return out
 
@@ -694,8 +1241,9 @@ def defend(max_s=30.0):
             "xyz": xyz_of(mob),
             "templateId": mob.get("templateId"),
         }
-        if should_flee(mob, s.get("level") or 1, attacker_count=len(aggro)):
-            print("FLEE too_hard", json.dumps({**rec, "attackers": len(aggro)}))
+        why_flee = flee_reason(mob, s.get("level"), attacker_count=len(aggro))
+        if why_flee:
+            print("FLEE", why_flee, json.dumps({**rec, "attackers": len(aggro), "player_level": s.get("level")}))
             flee_from(mob["x"], mob["z"], yards=40, max_s=8)
             return snapshot(), killed
         print("DEFEND", json.dumps(rec))
@@ -1032,17 +1580,36 @@ def pick_isolated(name_sub=None, level=None, min_level=None, max_level=None, min
     blockers = living_blockers(s, player_level)
     needle = name_sub if name_sub is not None else HUNT_NAME
     cands = []
+    who = s.get("name") or wanted_player() or SAFESPOT_OWNER
     for h in hostiles:
         if not hunt_name_match(h, needle):
-            continue
-        if not is_hunt_mob(h, player_level):
             continue
         lv = h.get("level")
         if level is not None and lv != level:
             continue
-        if min_level is not None and (lv is None or lv < min_level):
-            continue
-        if max_level is not None and (lv is None or lv > max_level):
+        skip = None
+        if not h.get("hostile"):
+            skip = "friendly"
+        elif not is_hunt_mob(h, player_level):
+            rare, elite = template_flags(h)
+            if rare:
+                skip = "rare"
+            elif elite:
+                skip = "elite"
+            elif is_overlevel(h, player_level):
+                skip = "over_level"
+            elif min_level is not None and (lv is None or lv < min_level):
+                skip = "low_level"
+            elif max_level is not None and (lv is None or lv > max_level):
+                skip = "high_level"
+            else:
+                skip = "not_hunt"
+        elif dest_is_foreign_home(h["x"], h["z"], who):
+            skip = "other_camp"
+        elif SAFESPOT and dist(h["x"], h["z"], SAFESPOT["x"], SAFESPOT["z"]) > CAST_RANGE + PULL_LEASH:
+            skip = "far_from_home"
+        if skip:
+            cands.append({**h, "why": skip, "xyz": xyz_of(h), "isolation": 0, "path": 0, "danger": 0, "mob_danger": 0, "crowd": 0, "leash": 0, "stage": None, "route": []})
             continue
         iso = isolation(h, hostiles)
         stage = staging_for(h, blockers, s, player_level=player_level)
@@ -1089,32 +1656,31 @@ def pick_isolated(name_sub=None, level=None, min_level=None, max_level=None, min
                 "xyz": xyz_of(h),
             }
         )
-    def _hunt_score(c):
-        d = c.get("dist") or 99.0
-        lv = c.get("level") or 1
-        return d - HUNT_LEVEL_YARDS * (lv - player_level)
-
     cands.sort(
         key=lambda c: (
             -(c.get("why") is None),
-            _hunt_score(c),
-            c.get("crowd") or 0,
-            c["dist"],
+            c.get("dist") or 99.0,
             -((c.get("level") or 1)),
+            c.get("crowd") or 0,
             -c["isolation"],
             -c["path"],
             -c["danger"],
         )
     )
+    hard = ("rare", "elite", "over_level", "friendly", "not_hunt", "name", "other_camp", "low_level", "high_level", "far_from_home")
     good = [c for c in cands if c.get("why") is None]
     if not good:
-        # Walk would clip an elite — still pull if the mob itself is not
-        # stacked on that elite. Never pick on_danger (social-aggro wipe).
-        good = [c for c in cands if c.get("why") != "on_danger"]
+        # Packed camp: still pull the closest legal mob. Do not idle.
+        good = [c for c in cands if c.get("why") not in hard]
+    if not good:
+        good = [c for c in cands if c.get("why") is None or c.get("why") in ("route_danger", "on_danger")]
     return good[0] if good else None, cands
 
 
 def move(flags, facing=None):
+    global HOME_WALKED
+    if flags and (flags.get("forward") or flags.get("back") or flags.get("strafeLeft") or flags.get("strafeRight")):
+        HOME_WALKED = True
     payload = json.dumps(dict(flags))
     if facing is None:
         j(f"window.__game.controller.move({payload})")
@@ -1193,6 +1759,62 @@ def is_los_error(err):
     return "line of sight" in t or "can't see" in t or "cannot see" in t
 
 
+_KNOWN = None
+_UNKNOWN = set()
+
+
+def mark_unknown_ability(ability_id):
+    if ability_id:
+        _UNKNOWN.add(str(ability_id))
+
+
+def known_abilities():
+    """Ability ids the character actually knows. frost_armor is not on this fire spec."""
+    global _KNOWN
+    if _KNOWN is None:
+        ids = (
+            j(
+                r"""
+(() => {
+  const w = window.__game && window.__game.world;
+  const K = w && w.known;
+  const out = [];
+  const walk = (v) => {
+    if (!v) return;
+    const d = v.def || v;
+    const id = d.id || v.id;
+    if (id) out.push(String(id));
+  };
+  if (K && typeof K.forEach === 'function') K.forEach(walk);
+  else if (Array.isArray(K)) K.forEach(walk);
+  else if (K) Object.values(K).forEach(walk);
+  return out;
+})()
+"""
+            )
+            or []
+        )
+        _KNOWN = {str(i) for i in ids}
+    return _KNOWN
+
+
+def knows_ability(ability_id):
+    if not ability_id:
+        return False
+    aid = str(ability_id)
+    if aid in _UNKNOWN:
+        return False
+    known = known_abilities()
+    if not known:
+        return True
+    return aid in known
+
+
+def is_unknown_ability_error(err):
+    t = (err or "").lower()
+    return "do not know" in t or "don't know" in t or "unknown ability" in t or "not learned" in t
+
+
 def is_busy_error(err):
     t = (err or "").lower()
     return (
@@ -1233,6 +1855,9 @@ def try_cast(ability_id, eid=None, wait=0.4, retries=3):
     """
     err = ""
     s = snapshot()
+    if not knows_ability(ability_id):
+        mark_unknown_ability(ability_id)
+        return False, "unknown_ability", s
     for attempt in range(max(1, retries)):
         s = wait_until_ready(timeout=3.5)
         if not s.get("ok") or s.get("dead"):
@@ -1259,6 +1884,10 @@ def try_cast(ability_id, eid=None, wait=0.4, retries=3):
             time.sleep(0.05)
         if not err:
             err = hud_error()
+        if is_unknown_ability_error(err):
+            mark_unknown_ability(ability_id)
+            print("CAST skip unknown", ability_id)
+            return False, "unknown_ability", snapshot()
         if is_busy_error(err) and attempt + 1 < retries:
             print("CAST busy, retry", json.dumps({"spell": ability_id, "attempt": attempt + 1, "err": err}))
             time.sleep(0.12)
@@ -1390,7 +2019,7 @@ def nova_is_safe(s=None, ignore_id=None, radius=ICEBIND_RADIUS):
 
 
 def pick_damage_spell(s, mob):
-    """Highest DPS from bars 2-4: Icebind only in melee, else Cinderbolt, else Rimelance."""
+    """Cinderbolt at range. Icebind only in melee when the nova will not leech a pack."""
     if not mob or mob.get("dead"):
         return None
     mana = s.get("mana") or 0
@@ -1400,17 +2029,16 @@ def pick_damage_spell(s, mob):
     # in melee so the root actually lands — and never when a packmate is
     # inside the nova (that is what pulled the second bone and killed us).
     if (
-        mana >= ICEBIND_COST
+        knows_ability(ICEBIND)
+        and mana >= ICEBIND_COST
         and d <= MELEE_RANGE
         and cooldown_remaining(ICEBIND, s) <= 0.08
         and not is_rooted(mob["id"])
         and nova_is_safe(s, ignore_id=mob.get("id"))
     ):
         return ICEBIND
-    if mana >= CINDERBOLT_COST and hp > BOLT_OVERKILL_HP and d <= CAST_RANGE:
+    if knows_ability(CINDERBOLT) and mana >= CINDERBOLT_COST and hp > BOLT_OVERKILL_HP and d <= CAST_RANGE:
         return CINDERBOLT
-    if mana >= RIMELANCE_COST and hp > 0 and d <= CAST_RANGE:
-        return RIMELANCE
     return None
 
 
@@ -1422,7 +2050,19 @@ def hold_safespot(stop_at=4.0):
     if not SAFESPOT:
         stop()
         return s
-    if dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) <= stop_at:
+    if not snapshot_is_ours(s):
+        stop()
+        return s
+    who = (s.get("name") or SAFESPOT_OWNER or wanted_player() or "").strip()
+    if dest_is_foreign_home(SAFESPOT["x"], SAFESPOT["z"], who):
+        stop()
+        return s
+    d = dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"])
+    if d <= stop_at:
+        stop()
+        return s
+    if d > HOME_HOLD_YARDS:
+        # Farther than a fight drift — walking here is how we crossed the map.
         stop()
         return s
     ang = face_to(SAFESPOT["x"], SAFESPOT["z"], s["x"], s["z"])
@@ -1448,6 +2088,9 @@ def press_damage(eid, mob, s=None, max_los_tries=3, planted=True):
 
 def press_blazing_barrier(s=None):
     """Bar 5. Instant self shield. Press after the first Cinderbolt of a pull."""
+    s = s or snapshot()
+    if not knows_ability(BLAZING_BARRIER):
+        return False, "unknown_ability", s
     s = wait_until_ready(timeout=3.5)
     if has_aura(s, BLAZING_BARRIER):
         return False, "already", s
@@ -1541,13 +2184,21 @@ def aura_remaining(s, aura_id):
 
 
 def ensure_buffs(min_remaining=BUFF_REFRESH_REMAINING):
-    """Keep Hoarfrost Mantle (3) and Aether Insight (4) up. Instant, 30 min, not used in the fight."""
+    """Keep known self-buffs up. Skip anything not learned (no frost_armor on fire)."""
     s = snapshot()
-    if aura_remaining(s, MANTLE) < min_remaining and (s.get("mana") or 0) >= MANTLE_COST:
+    if (
+        knows_ability(MANTLE)
+        and aura_remaining(s, MANTLE) < min_remaining
+        and (s.get("mana") or 0) >= MANTLE_COST
+    ):
         cast(MANTLE)
         time.sleep(0.3)
         s = snapshot()
-    if aura_remaining(s, INSIGHT) < min_remaining and (s.get("mana") or 0) >= INSIGHT_COST:
+    if (
+        knows_ability(INSIGHT)
+        and aura_remaining(s, INSIGHT) < min_remaining
+        and (s.get("mana") or 0) >= INSIGHT_COST
+    ):
         # Insight is buffTarget/party. Land it on us, then put the fight target back.
         had = s.get("targetId")
         pid = s.get("id")
@@ -1599,6 +2250,22 @@ def move_toward(
         if not s.get("ok") or s.get("dead"):
             stop()
             return s
+        if not snapshot_is_ours(s):
+            stop()
+            return s
+        who = s.get("name") or wanted_player() or SAFESPOT_OWNER
+        if dest_is_foreign_home(tx, tz, who):
+            stop()
+            return s
+        if SAFESPOT:
+            dest_is_home = dist(tx, tz, SAFESPOT["x"], SAFESPOT["z"]) <= 6.0
+            if not dest_is_home:
+                if dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) > 35.0:
+                    stop()
+                    return s
+                if dist(tx, tz, SAFESPOT["x"], SAFESPOT["z"]) > 40.0:
+                    stop()
+                    return s
         if attackers(s):
             stop()
             s["aborted_adds"] = True
@@ -1642,55 +2309,28 @@ def move_toward(
 
 
 def approach_entity(eid, stop_at=PULL_RANGE, max_s=16.0, add_radius=12.0):
-    """Home on a same-side stand-off. Never walk through or past the mob."""
+    """Short leash walk toward eid. Prefer step_out_to_tag for pulls."""
+    return step_out_to_tag(eid, max_away=PULL_LEASH, max_s=min(max_s, 7.0))
+
+
+def step_out_to_tag(eid, max_away=None, max_s=7.0):
+    """Take a short step toward the mob so Attack can land, then stop. Never leave the leash."""
+    max_away = PULL_LEASH if max_away is None else max_away
     t0 = time.time()
-    last = snapshot()
-    last_pos_t = t0
-    start = last
     while time.time() - t0 < max_s:
         s = snapshot()
         mob = entity(eid)
         if not s.get("ok") or s.get("dead") or not mob or mob.get("dead"):
             stop()
             return s, mob, "gone"
-        # Packmates standing nearby are not adds. Only abort if something
-        # actually aggroed us, or we walked into an elite/over-level bubble.
-        incoming = [e for e in attackers(s) if e.get("id") != eid]
-        if incoming:
-            stop()
-            return s, mob, "adds"
-        dangers = danger_nearby(s, ignore_id=eid)
-        if dangers:
-            stop()
-            s["danger"] = [
-                {"id": d.get("id"), "name": d.get("name"), "level": d.get("level"), "dist": d.get("dist")}
-                for d in dangers[:4]
-            ]
-            return s, mob, "danger"
-        if mob["dist"] <= stop_at:
+        if (mob.get("dist") or 99) <= CAST_RANGE:
             stop()
             return s, mob, "ok"
-        # We started on one side of the wolf. If we are now on the other side,
-        # the walk went through it.
-        if start and _beyond_mob(start["x"], start["z"], mob, s["x"], s["z"], slop=1.0):
+        if SAFESPOT and dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) >= max_away:
             stop()
-            return s, mob, "past"
-        hostiles = living_blockers(s, s.get("level") or 1)
-        dest_x, dest_z = _stand_off(mob, s, stop_at)
-        wx, wz, _route = next_step_toward(s, dest_x, dest_z, hostiles, ignore_id=eid)
-        if _beyond_mob(s["x"], s["z"], mob, wx, wz):
-            wx, wz = dest_x, dest_z
-        ang = face_to(wx, wz, s["x"], s["z"])
-        now = time.time()
-        moved = dist(s["x"], s["z"], last["x"], last["z"]) if last else 1
-        stuck = (now - last_pos_t) > 0.45 and moved < 0.35
-        if not stuck and moved >= 0.35:
-            last = s
-            last_pos_t = now
-        elif stuck:
-            last = s
-            last_pos_t = now
-        move({"forward": True, "jump": True if stuck else int((now - t0) * 8) % 10 == 0}, ang)
+            return s, mob, "leash"
+        ang = face_to(mob["x"], mob["z"], s["x"], s["z"])
+        move({"forward": True}, ang)
         time.sleep(0.12)
     stop()
     return snapshot(), entity(eid), "timeout"
@@ -1869,8 +2509,24 @@ def conjure_rations(s, need_food, need_water):
     return snapshot()
 
 
-def recover(hp_frac=0.85, mana_frac=0.7):
-    """Walk to the safespot, then Breadbind / Waterbind, then eat / drink."""
+def needs_recover(s, hp_frac=None, mana_frac=0.9):
+    """True if this character is too hurt or dry to open a pull."""
+    if not s or not s.get("ok") or s.get("dead"):
+        return False
+    hp_frac = MIN_PULL_HP_FRAC if hp_frac is None else hp_frac
+    max_hp = s.get("maxHp") or 0
+    max_mana = s.get("maxMana") or 0
+    if max_hp <= 0:
+        return True
+    if (s.get("hp") or 0) < max_hp * hp_frac:
+        return True
+    if max_mana > 0 and (s.get("mana") or 0) < max_mana * mana_frac:
+        return True
+    return False
+
+
+def recover(hp_frac=0.95, mana_frac=0.9):
+    """Walk to the safespot, then Breadbind / Waterbind, then eat / drink until topped up."""
     s = snapshot()
     if not is_resting(s):
         stop()
@@ -1878,7 +2534,7 @@ def recover(hp_frac=0.85, mana_frac=0.7):
         s = go_safespot()
         if s.get("dead"):
             return s
-    for _attempt in range(6):
+    for _attempt in range(12):
         s = snapshot()
         if not s.get("ok") or s.get("dead"):
             return s
@@ -1941,6 +2597,9 @@ def recover(hp_frac=0.85, mana_frac=0.7):
                 return s
             time.sleep(0.4)
         if not interrupted:
-            return snapshot()
+            s = snapshot()
+            if not needs_recover(s, hp_frac=hp_frac, mana_frac=mana_frac):
+                return s
+            print("RECOVER still short", json.dumps({"hp": s.get("hp"), "maxHp": s.get("maxHp"), "mana": s.get("mana")}))
     stop()
     return snapshot()

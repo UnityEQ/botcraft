@@ -36,6 +36,7 @@ def _load_woc_lib():
     )
 
 
+os.environ["WOC_HALT_ON_EXIT"] = "1"
 _load_woc_lib()
 
 # 0 = no cap (default). Set WOC_HUNT_ROUNDS=8 to restore a fixed count.
@@ -67,8 +68,15 @@ def hunt():
     if not s.get("ok"):
         note("no_game")
         return log
+    if not snapshot_is_ours(s):
+        note("wrong_player", {"name": s.get("name"), "want": wanted_player() or None, "owner": SAFESPOT_OWNER})
+        activate_game()
+        return log
     if SAFESPOT is None:
-        set_safespot(s)
+        set_safespot(s, force=True)
+    if SAFESPOT is None:
+        note("no_home")
+        return log
     note(
         "character",
         {
@@ -83,7 +91,7 @@ def hunt():
         note("dead_cannot_hunt", {"hp": s["hp"]})
         return log
 
-    if s["hp"] < s["maxHp"] * 0.9 or s["mana"] < s["maxMana"] * 0.75:
+    if needs_recover(s, hp_frac=MIN_PULL_HP_FRAC, mana_frac=0.75):
         note("recover_first", {"hp": s["hp"], "mana": s["mana"]})
         s = recover(hp_frac=0.95, mana_frac=0.9)
 
@@ -93,6 +101,12 @@ def hunt():
 
     aggro = attackers(s)
     if aggro:
+        if needs_recover(s, hp_frac=MIN_PULL_HP_FRAC, mana_frac=0.0):
+            note("flee_low_hp_before_hunt", {"hp": s.get("hp"), "maxHp": s.get("maxHp"), "adds": len(aggro)})
+            attack(False)
+            go_safespot()
+            recover(hp_frac=0.95, mana_frac=0.9)
+            return log
         note(
             "defend_before_hunt",
             [{"id": a.get("id"), "name": a.get("name"), "dist": a.get("dist"), "hp": a.get("hp")} for a in aggro],
@@ -102,31 +116,15 @@ def hunt():
         if s.get("dead"):
             note("we_died", {"hp": s["hp"]})
             return log
-        if s["hp"] < s["maxHp"] * 0.9 or s["mana"] < s["maxMana"] * 0.75:
-            s = recover(hp_frac=0.95, mana_frac=0.9)
+        s = recover(hp_frac=0.95, mana_frac=0.9)
 
     if s.get("dead"):
         note("dead_cannot_hunt", {"hp": s["hp"]})
         return log
-    if s["hp"] < s["maxHp"] * MIN_PULL_HP_FRAC:
-        note("skip_low_hp", {"hp": s["hp"], "maxHp": s["maxHp"]})
+    if needs_recover(s, hp_frac=MIN_PULL_HP_FRAC, mana_frac=0.75):
+        note("skip_low_hp", {"hp": s["hp"], "maxHp": s["maxHp"], "mana": s.get("mana")})
+        recover(hp_frac=0.95, mana_frac=0.9)
         return log
-
-    pack = [h for h in living_hostiles(s) if (h.get("dist") or 99) <= 14]
-    if len(pack) >= 2:
-        note(
-            "leave_pack",
-            [{"id": h.get("id"), "name": h.get("name"), "dist": h.get("dist")} for h in pack[:6]],
-        )
-        cx = sum(h["x"] for h in pack) / len(pack)
-        cz = sum(h["z"] for h in pack) / len(pack)
-        flee_from(cx, cz, yards=36, max_s=8)
-        if SAFESPOT:
-            go_safespot()
-        s = recover(hp_frac=0.95, mana_frac=0.9)
-        if s.get("dead"):
-            note("we_died", {"hp": s["hp"]})
-            return log
 
     s = ensure_buffs()
     note(
@@ -193,14 +191,13 @@ def hunt():
             [
                 {
                     "id": c["id"],
+                    "name": c.get("name"),
+                    "level": c.get("level"),
+                    "dist": c.get("dist"),
                     "xyz": c.get("xyz") or xyz_of(c),
-                    "iso": c.get("isolation"),
-                    "path": c.get("path"),
-                    "danger": c.get("danger"),
-                    "crowd": c.get("crowd"),
                     "why": c.get("why"),
                 }
-                for c in cands[:5]
+                for c in cands[:8]
             ],
         )
         return log
@@ -226,74 +223,50 @@ def hunt():
     s = snapshot()
     mob = entity(wid)
     already_in_range = mob and not mob.get("dead") and 16.0 <= mob["dist"] <= CAST_RANGE
+    mob_from_home = None
+    if SAFESPOT and mob and not mob.get("dead"):
+        mob_from_home = dist(mob["x"], mob["z"], SAFESPOT["x"], SAFESPOT["z"])
 
-    if already_in_range:
+    if SAFESPOT:
+        if mob_from_home is None or mob_from_home > CAST_RANGE + PULL_LEASH:
+            note(
+                "skip_mob_far_from_home",
+                {
+                    "mob_from_home": None if mob_from_home is None else round(mob_from_home, 1),
+                    "home": SAFESPOT,
+                    "mob": xyz_of(mob) if mob else None,
+                },
+            )
+            go_safespot(stop_at=5.0, max_s=12.0)
+            return log
+        home_now = dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"])
+        if home_now > PULL_HOME_MAX:
+            note("skip_bad_home_xyz", {"dist": round(home_now, 1), "home": SAFESPOT, "me": [s.get("x"), s.get("z")]})
+            stop()
+            return log
+        if home_now > 5.0:
+            note("return_home_before_tag", {"dist": round(home_now, 1), "mob_from_home": round(mob_from_home, 1)})
+            go_safespot(stop_at=5.0, max_s=8.0, max_away=PULL_HOME_MAX)
+            s = snapshot()
+            mob = entity(wid)
+        if mob and (mob.get("dist") or 99) > CAST_RANGE:
+            note("step_out_tag", {"dist": mob.get("dist"), "mob_from_home": round(mob_from_home, 1)})
+            s, mob, why_step = step_out_to_tag(wid, max_away=PULL_LEASH, max_s=7.0)
+            note("stepped_out", {"why": why_step, "dist": None if not mob else mob.get("dist")})
+        stop()
+        note("pull_from_home", {"mob_from_home": round(mob_from_home, 1), "dist": None if not mob else mob.get("dist")})
+        mob = entity(wid)
+    elif already_in_range:
         note("already_in_range", {"dist": mob["dist"], "xyz": xyz_of(mob)})
         stop()
     else:
-        # One walk: live wolf xyz + every nearby NPC xyz, bent around packs.
-        note(
-            "walk_to_wolf",
-            {
-                "wolf_xyz": xyz_of(mob) if mob else None,
-                "me": [s.get("x"), s.get("y"), s.get("z")],
-                "route": pick.get("route"),
-            },
-        )
-        s, mob, why = approach_entity(wid, stop_at=PULL_RANGE, max_s=28, add_radius=12.0)
+        note("no_home_skip_walk", {"dist": None if not mob else mob.get("dist")})
         stop()
-        if why == "danger":
-            dangers = danger_nearby(s, ignore_id=wid)
-            note(
-                "abort_danger_on_walk",
-                {
-                    "wolf": mob,
-                    "danger": [
-                        {
-                            "id": d.get("id"),
-                            "name": d.get("name"),
-                            "level": d.get("level"),
-                            "dist": d.get("dist"),
-                            "xyz": xyz_of(d),
-                        }
-                        for d in dangers[:4]
-                    ],
-                    "hp": s.get("hp"),
-                },
-            )
-            if dangers:
-                flee_from(dangers[0]["x"], dangers[0]["z"], yards=36, max_s=7)
-            return log
-        if why == "adds":
-            extras = adds_on_us(s, ignore_id=wid, radius=12)
-            aggro = attackers(s)
-            if aggro:
-                note("defend_on_walk", {"wolf": mob, "adds": aggro, "hp": s["hp"]})
-                s, killed = defend()
-                note("defended", {"killed": killed, "hp": s.get("hp")})
-                return log
-            note("abort_adds_on_walk", {"wolf": mob, "adds": extras, "hp": s["hp"]})
-            if extras:
-                back_off(extras[0]["x"], extras[0]["z"], yards=24, max_s=6)
-            else:
-                move_toward(-8, -8, stop_at=8, max_s=8, jump=True)
-            return log
-        if not mob or mob.get("dead") or why == "gone":
-            note("wolf_died_before_pull")
-            return log
-        if why == "past":
-            note("ran_past_wolf", {"dist": mob.get("dist"), "wolf_xyz": xyz_of(mob), "me": [s.get("x"), s.get("y"), s.get("z")]})
-            s = back_off(mob["x"], mob["z"], yards=PULL_RANGE, max_s=5)
-            mob = entity(wid)
-            if not mob or mob.get("dead") or mob["dist"] > CAST_RANGE:
-                return log
-        if why == "timeout" and (not mob or mob.get("dist", 99) > CAST_RANGE):
-            note("approach_timeout", {"dist": None if not mob else mob.get("dist"), "me": [s.get("x"), s.get("y"), s.get("z")]})
-            return log
-        note("arrived", {"dist": mob.get("dist"), "why": why, "wolf_xyz": xyz_of(mob), "me": [s.get("x"), s.get("y"), s.get("z")]})
+        return log
 
     extras = adds_on_us(s, ignore_id=wid, radius=12)
-    dangers = danger_nearby(s, ignore_id=wid)
+    home_now = dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) if SAFESPOT and s.get("ok") else 0
+    dangers = danger_nearby(s, ignore_id=wid) if home_now > PULL_LEASH else []
     if dangers:
         note(
             "abort_danger_on_approach",
@@ -305,7 +278,7 @@ def hunt():
                 ],
             },
         )
-        flee_from(dangers[0]["x"], dangers[0]["z"], yards=36, max_s=7)
+        go_safespot(stop_at=5.0, max_s=16.0)
         return log
     aggro = attackers(s)
     if aggro:
@@ -318,7 +291,10 @@ def hunt():
         return log
     if mob["dist"] < MELEE_RANGE:
         note("too_close_backing_out", {"dist": mob["dist"]})
-        s = back_off(mob["x"], mob["z"], yards=PULL_RANGE, max_s=5)
+        if SAFESPOT:
+            go_safespot(stop_at=5.0, max_s=8.0)
+        else:
+            s = back_off(mob["x"], mob["z"], yards=PULL_RANGE, max_s=5)
         mob = entity(wid)
         if not mob or mob.get("dead"):
             note("wolf_died_before_pull")
@@ -327,8 +303,8 @@ def hunt():
     s = snapshot()
     if s.get("dead") or s["hp"] < s["maxHp"] * MIN_PULL_HP_FRAC:
         note("skip_low_hp_before_pull", {"hp": s.get("hp"), "maxHp": s.get("maxHp")})
-        if mob:
-            back_off(mob["x"], mob["z"], yards=20, max_s=4)
+        if SAFESPOT:
+            go_safespot(stop_at=5.0, max_s=12.0)
         return log
 
     # Tag with Attack (1) and run. Do not plant a Cinderbolt or Barrier in the camp.
@@ -348,7 +324,7 @@ def hunt():
             [{"id": e.get("id"), "name": e.get("name"), "dist": e.get("dist")} for e in incoming],
         )
         attack(False)
-        flee_from(incoming[0]["x"], incoming[0]["z"], yards=42, max_s=9)
+        go_safespot(stop_at=5.0, max_s=16.0)
         recover(hp_frac=0.95, mana_frac=0.9)
         return log
 
@@ -356,16 +332,45 @@ def hunt():
     bolts = 0
     if SAFESPOT:
         s = snapshot()
+        if not snapshot_is_ours(s):
+            note("wrong_player_on_pull", {"name": s.get("name"), "want": wanted_player() or None})
+            activate_game()
+            stop()
+            return log
         home_d = dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"])
-        if home_d > 8.0:
-            note("pull_home", {"from": [round(s["x"], 1), round(s["z"], 1)], "home": SAFESPOT, "dist": round(home_d, 1)})
-            s, why_home = kite_to_safespot(ignore_id=wid, stop_at=6.0, max_s=22.0)
+        if home_d > PULL_HOME_MAX:
+            note(
+                "home_too_far",
+                {
+                    "from": [round(s["x"], 1), round(s["z"], 1)],
+                    "home": SAFESPOT,
+                    "dist": round(home_d, 1),
+                    "owner": SAFESPOT_OWNER,
+                },
+            )
+            stop()
+            return log
+        if home_d > 4.0:
+            note(
+                "pull_home",
+                {
+                    "from": [round(s["x"], 1), round(s["z"], 1)],
+                    "home": SAFESPOT,
+                    "dist": round(home_d, 1),
+                    "name": s.get("name"),
+                    "id": s.get("id"),
+                },
+            )
+            s, why_home = kite_to_safespot(ignore_id=wid, stop_at=5.0, max_s=8.0)
             note("pulled_home", {"why": why_home, "pos": [round(s.get("x") or 0, 1), round(s.get("z") or 0, 1)]})
             if s.get("dead"):
                 note("we_died", {"hp": s.get("hp")})
                 stop()
                 attack(False)
                 return log
+            if why_home in ("timeout", "too_far", "wrong_player", "wrong_way", "stuck"):
+                stop()
+            home_d = dist(s["x"], s["z"], SAFESPOT["x"], SAFESPOT["z"]) if s.get("ok") else home_d
             extras = [e for e in attackers(s) if e.get("id") != wid]
             if extras or why_home == "adds":
                 note(
@@ -373,8 +378,7 @@ def hunt():
                     [{"id": e.get("id"), "name": e.get("name"), "dist": e.get("dist")} for e in extras[:4]],
                 )
                 attack(False)
-                src = extras[0] if extras else s
-                flee_from(src.get("x") or s["x"], src.get("z") or s["z"], yards=42, max_s=9)
+                go_safespot()
                 recover(hp_frac=0.95, mana_frac=0.9)
                 return log
             mob = entity(wid)
@@ -388,7 +392,7 @@ def hunt():
                     [{"id": h.get("id"), "name": h.get("name"), "dist": h.get("dist")} for h in pack[:4]],
                 )
                 attack(False)
-                flee_from(pack[0]["x"], pack[0]["z"], yards=36, max_s=8)
+                go_safespot()
                 recover(hp_frac=0.95, mana_frac=0.9)
                 return log
             s = ensure_hostile_target(wid, s)
@@ -415,6 +419,11 @@ def hunt():
     while time.time() - t0 < 16:
         s = snapshot()
         mob = entity(wid)
+        if s.get("ok") and not snapshot_is_ours(s):
+            note("wrong_player_in_fight", {"name": s.get("name"), "want": wanted_player() or None})
+            stop()
+            activate_game()
+            return log
         if s.get("dead"):
             note("we_died", {"hp": s["hp"]})
             stop()
@@ -438,7 +447,7 @@ def hunt():
                 },
             )
             attack(False)
-            flee_from(incoming[0]["x"], incoming[0]["z"], yards=42, max_s=9)
+            go_safespot()
             recover(hp_frac=0.95, mana_frac=0.9)
             return log
         extras = [e for e in adds_on_us(s, ignore_id=wid, radius=ADD_ABORT_RANGE) if e.get("targetId") == s.get("id")]
@@ -452,7 +461,7 @@ def hunt():
                 },
             )
             attack(False)
-            flee_from(extras[0]["x"], extras[0]["z"], yards=42, max_s=9)
+            go_safespot()
             recover(hp_frac=0.95, mana_frac=0.9)
             return log
         hold_safespot()
@@ -478,6 +487,9 @@ def hunt():
                     used_barrier = True
                     note("bar5_blazing_barrier", {"started": started5, "err": err5 or None})
             else:
+                if err == "unknown_ability" or is_unknown_ability_error(err):
+                    mark_unknown_ability(spell)
+                    continue
                 note("cast_blocked", {"spell": spell, "err": err, "dist": mob["dist"], "hp": hp})
         time.sleep(0.12)
 
@@ -507,7 +519,7 @@ def hunt():
         )
         attack(False)
         if should_flee(aggro[0], s.get("level") or 1, attacker_count=len(aggro)) or len(aggro) >= 2:
-            flee_from(aggro[0]["x"], aggro[0]["z"], yards=42, max_s=9)
+            go_safespot()
             recover(hp_frac=0.95, mana_frac=0.9)
             return log
         s, killed = defend()
@@ -526,8 +538,7 @@ def hunt():
     else:
         note("skip_loot", {"adds": extras})
 
-    # Conjure first (recover), then walk home to sit. Do not walk home first.
-    recover()
+    recover(hp_frac=0.95, mana_frac=0.9)
     s = snapshot()
     note("done", {"hp": s["hp"], "mana": s["mana"], "xp": s["xp"], "pos": [s["x"], s["z"]]})
     return log
@@ -584,9 +595,11 @@ def check_after(round_i, log):
             return "kill", report
     if moving:
         return "stuck_moving", report
-    if log_has(log, "skip_low_hp", "skip_low_hp_before_pull"):
+    if log_has(log, "skip_low_hp", "skip_low_hp_before_pull", "flee_low_hp_before_hunt"):
         return "low_hp", report
     if log_has(log, "wolf_dead"):
+        if (s.get("maxHp") or 0) and (s.get("hp") or 0) < (s.get("maxHp") or 1) * MIN_PULL_HP_FRAC:
+            return "low_hp", report
         return "kill", report
     if log_has(log, "no_safe_target", "no_safe_wolf", "wolf_died_before_pull"):
         return "no_target", report
@@ -624,10 +637,26 @@ def loop():
             try:
                 activate_game()
                 stop()
-                if SAFESPOT is None:
-                    s0 = snapshot()
-                    if s0.get("ok"):
-                        set_safespot(s0)
+                s0 = snapshot()
+                who = (s0.get("name") or "").strip()
+                want = wanted_player()
+                if want and who.lower() != want.lower():
+                    print("WAIT snapshot is", who or "?", "wanted", want)
+                    time.sleep(2)
+                    continue
+                if s0.get("ok"):
+                    stamp_start_home()
+                if SAFESPOT:
+                    print(
+                        "SAFESPOT locked",
+                        json.dumps(
+                            {
+                                "player": SAFESPOT_OWNER,
+                                "index": SAFESPOT_INDEX,
+                                "home": SAFESPOT,
+                            }
+                        ),
+                    )
                 break
             except KeyboardInterrupt:
                 raise
@@ -648,22 +677,31 @@ def loop():
                     continue
                 aggro = attackers(s)
                 if aggro:
-                    print(
-                        "DEFEND before round",
-                        json.dumps(
-                            [{"id": a.get("id"), "name": a.get("name"), "dist": a.get("dist"), "hp": a.get("hp")} for a in aggro]
-                        ),
-                    )
-                    s, killed = defend()
-                    if killed:
-                        kills += len(killed)
-                        print("DEFENDED", json.dumps(killed))
+                    if needs_recover(s, hp_frac=MIN_PULL_HP_FRAC, mana_frac=0.0):
+                        print("FLEE low hp before defend", s.get("hp"), "/", s.get("maxHp"))
+                        attack(False)
+                        go_safespot()
+                        s = recover(hp_frac=0.95, mana_frac=0.9)
+                    else:
+                        print(
+                            "DEFEND before round",
+                            json.dumps(
+                                [{"id": a.get("id"), "name": a.get("name"), "dist": a.get("dist"), "hp": a.get("hp")} for a in aggro]
+                            ),
+                        )
+                        s, killed = defend()
+                        if killed:
+                            kills += len(killed)
+                            print("DEFENDED", json.dumps(killed))
                 stop_if_dead(s, "before_round")
-                max_hp = s.get("maxHp") or 1
-                if (s.get("hp") or 0) < max_hp * MIN_PULL_HP_FRAC:
+                if needs_recover(s, hp_frac=MIN_PULL_HP_FRAC, mana_frac=0.75):
                     print("RECOVER", s.get("hp"), "/", s.get("maxHp"))
                     s = recover(hp_frac=0.95, mana_frac=0.9)
                     stop_if_dead(s, "while_recovering")
+                    if needs_recover(s, hp_frac=MIN_PULL_HP_FRAC, mana_frac=0.75):
+                        print("WAIT still recovering", s.get("hp"), "/", s.get("maxHp"))
+                        time.sleep(3)
+                        continue
                 log = hunt()
                 outcome, report = check_after(i, log)
                 report["outcome"] = outcome
@@ -687,10 +725,14 @@ def loop():
                     fail += 1
                 elif outcome == "no_target":
                     print("WAIT no hunt target, 8s")
-                    s, killed = wait_or_defend(8)
-                    if killed:
-                        kills += len(killed)
-                        print("DEFENDED", json.dumps(killed))
+                    s = snapshot()
+                    if needs_recover(s, hp_frac=MIN_PULL_HP_FRAC, mana_frac=0.75):
+                        s = recover(hp_frac=0.95, mana_frac=0.9)
+                    else:
+                        s, killed = wait_or_defend(8)
+                        if killed:
+                            kills += len(killed)
+                            print("DEFENDED", json.dumps(killed))
                     fail = 0
                 else:
                     fail += 1
@@ -698,15 +740,17 @@ def loop():
                     print("WAIT fail streak, backing off 12s", fail)
                     stop()
                     attack(False)
-                    s, killed = wait_or_defend(12)
+                    s = recover(hp_frac=0.95, mana_frac=0.9)
+                    fail = 0
+                s = snapshot()
+                if needs_recover(s, hp_frac=MIN_PULL_HP_FRAC, mana_frac=0.75):
+                    s = recover(hp_frac=0.95, mana_frac=0.9)
+                else:
+                    s, killed = wait_or_defend(1.2)
+                    stop_if_dead(s, "between_rounds")
                     if killed:
                         kills += len(killed)
-                    fail = 0
-                s, killed = wait_or_defend(1.2)
-                stop_if_dead(s, "between_rounds")
-                if killed:
-                    kills += len(killed)
-                    print("DEFENDED", json.dumps(killed))
+                        print("DEFENDED", json.dumps(killed))
             except KeyboardInterrupt:
                 raise
             except SystemExit:
@@ -726,12 +770,9 @@ def loop():
                 time.sleep(3)
     except KeyboardInterrupt:
         print("STOP interrupted")
+        raise SystemExit(130)
     finally:
-        try:
-            stop()
-            attack(False)
-        except Exception:
-            pass
+        halt_movement("loop_done")
         try:
             s = snapshot()
         except Exception:

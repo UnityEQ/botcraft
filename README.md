@@ -102,6 +102,44 @@ $env:WOC_HUNT_ROUNDS = "8"
 
 If you die, the hunt **exits** (code 2) and the watchdog does not relaunch. Rez, then start the hunt again. If it cannot find a target, it waits and retries.
 
+Pin a character when more than one ClaudeCraft tab is open:
+
+```powershell
+.\scripts\hunt.ps1 -Player CharacterName
+```
+
+## Two characters at once
+
+Two windows of the **same** Chrome share one debug connection. Two hunts there will steal each other's tab. For two characters at the same time you need **two Chrome instances**.
+
+`start-chrome.ps1` opens a **separate** Chrome (its own folder). That is why your usual profile list is empty. It is not your everyday Chrome — it exists so the second hunt has its own debug port.
+
+**First time only** — copy one of your real Chrome profiles so Google login comes along:
+
+```powershell
+.\scripts\start-chrome.ps1 -Name alt -ListProfiles
+.\scripts\start-chrome.ps1 -Name alt -CloneProfile "Default"
+```
+
+Use the `Directory` column from `-ListProfiles` (`Default`, `Profile 1`, …). Close that profile in normal Chrome if the copy complains about locked files.
+
+**Window 1** — your normal Chrome:
+
+```powershell
+.\scripts\hunt.ps1 -Player FirstName
+```
+
+**Window 2** — after the alt Chrome is open and that character is in-world, **second** PowerShell:
+
+```powershell
+.\scripts\start-daemon.ps1 -Name alt
+.\scripts\hunt.ps1 -Name alt -Player SecondName
+```
+
+You do **not** run `start-chrome` every hunt. Only when that second window is closed. The alt folder keeps the login. `hunt.ps1 -Name alt` remembers the port.
+
+Click **Allow remote debugging** on the new Chrome if it asks. Each hunt has its own safespot. Ctrl+C in that terminal stops only that hunt.
+
 ## Map overlay
 
 Independent of the hunt. Edit `examples\woc_map_npcs.py`, then run it to push the overlay into the live game tab.
@@ -152,8 +190,9 @@ print(page_info())
 | `scripts\check-setup.ps1` | PATH, Chrome, `browser-use --doctor` |
 | `scripts\stop-daemon.ps1` | Kill the daemon (next run will prompt Allow again) |
 | `scripts\run.ps1 <file>` | Run a Python file against the live tab |
-| `scripts\hunt.ps1` | Hunt loop with auto-restart (stops if you die) |
+| `scripts\hunt.ps1` | Hunt loop with auto-restart (stops if you die). `-Player`, `-Name` |
 | `scripts\map.ps1` | Install or refresh the world-map NPC overlay |
+| `scripts\start-chrome.ps1 -Name alt` | Second Chrome instance for a second hunt |
 
 ## Troubleshooting
 
