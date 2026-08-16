@@ -79,8 +79,13 @@ NORMAL_KEEP = 10.0
 DANGER_KEEP = 22.0
 # Never open a pull below this fraction of max HP.
 MIN_PULL_HP_FRAC = 0.9
-# Cloth cannot finish a hard cast below this. Run, do not tank.
+# Cloth cannot finish a hard cast below this. Run, do not tank —
+# unless the current target is already in execute range.
 FLEE_HP_FRAC = 0.55
+# Stay in a 1v1 if the mob is this hurt (one bolt / a few wand swings).
+FINISH_HP = 40
+# If we are this low, flee even if the mob is dying — unless we have Barrier.
+PANIC_HP_FRAC = 0.2
 # Do not sit inside the 20y aggro clamp.
 SIT_CLEAR_YARDS = 24.0
 # Hunt band: player-7 through player+1.
@@ -1474,16 +1479,56 @@ def hostiles_near_point(s, x, z, radius=SIT_CLEAR_YARDS):
     return out
 
 
-def should_reset(s, aggro=None):
-    """True if standing to fight will get us killed."""
+def mob_almost_dead(mob):
+    """True when one more bolt or a few wand hits should finish them."""
+    if not mob or mob.get("dead"):
+        return False
+    hp = mob.get("hp") or 0
+    mx = mob.get("maxHp") or 0
+    if hp <= FINISH_HP:
+        return True
+    if mx and hp / mx <= 0.22:
+        return True
+    return False
+
+
+def should_reset(s, aggro=None, finish_mob=None):
+    """True if standing to fight will get us killed.
+
+    A 1v1 on a dying mob is not a reset — finish it, and Barrier if we can.
+    Packs / rares / bosses still run.
+    """
     if not s or not s.get("ok") or s.get("dead"):
         return True
-    if hp_frac(s) <= FLEE_HP_FRAC:
-        return True
     aggro = attackers(s) if aggro is None else aggro
-    if not aggro:
+    if aggro and should_flee(aggro[0], s.get("level") or 1, attacker_count=len(aggro)):
+        return True
+    if hp_frac(s) > FLEE_HP_FRAC:
         return False
-    return should_flee(aggro[0], s.get("level") or 1, attacker_count=len(aggro))
+    if (
+        finish_mob
+        and mob_almost_dead(finish_mob)
+        and len(aggro or []) <= 1
+        and (hp_frac(s) > PANIC_HP_FRAC or has_aura(s, BLAZING_BARRIER))
+    ):
+        return False
+    return True
+
+
+def maybe_finish_barrier(s, mob):
+    """Pop Blazing Barrier while we stay to finish a dying 1v1."""
+    if not s or not mob or mob.get("dead"):
+        return False, s
+    if hp_frac(s) > FLEE_HP_FRAC:
+        return False, s
+    if not mob_almost_dead(mob):
+        return False, s
+    if has_aura(s, BLAZING_BARRIER):
+        return False, s
+    started, err, s = press_blazing_barrier(s)
+    if started:
+        print("BAR5 finish", json.dumps({"hp": s.get("hp"), "wolf": mob.get("hp"), "err": err or None}))
+    return bool(started), s
 
 
 def reset_combat(s=None):
@@ -1571,10 +1616,11 @@ def fight_entity(eid, max_s=22.0):
             stop()
             attack(False)
             return s, mob, "dead"
-        if should_reset(s):
-            print("FLEE low_hp fight", json.dumps({"hp": s.get("hp"), "maxHp": s.get("maxHp"), "id": eid}))
+        if should_reset(s, finish_mob=mob):
+            print("FLEE low_hp fight", json.dumps({"hp": s.get("hp"), "maxHp": s.get("maxHp"), "id": eid, "wolf": mob.get("hp")}))
             reset_combat(s)
             return snapshot(), entity(eid), "fled"
+        maybe_finish_barrier(s, mob)
         s = ensure_hostile_target(eid, s)
         keep_autoattack(s)
         hold_safespot()
@@ -1622,7 +1668,7 @@ def defend(max_s=30.0):
             "templateId": mob.get("templateId"),
         }
         why_flee = flee_reason(mob, s.get("level"), attacker_count=len(aggro))
-        if why_flee or should_reset(s, aggro):
+        if why_flee or should_reset(s, aggro, finish_mob=mob):
             print(
                 "FLEE",
                 why_flee or "low_hp",
@@ -3151,6 +3197,36 @@ def is_combat_error(err):
 
 # Server keeps a combat lock after the last hit. Client inCombat often drops first.
 COMBAT_DROP_SEC = 6.0
+# How long after client inCombat goes false before eat/conjure will stick.
+# Longer than this just sits there; shorter spams "while in combat".
+REST_AFTER_COMBAT_SEC = 1.0
+
+
+def wait_until_restable(timeout=4.0):
+    """Wait until nobody is hitting us and the post-kill lock has dropped.
+
+    Does not wait the full server lock if we have already been clear.
+    """
+    t0 = time.time()
+    clear_since = None
+    while time.time() - t0 < timeout:
+        s = snapshot()
+        if not s.get("ok") or s.get("dead"):
+            return s
+        if attackers(s) or s.get("inCombat"):
+            clear_since = None
+            time.sleep(0.12)
+            continue
+        hold = s.get("combatExitHoldUntil") or 0
+        if hold > 1e11 and time.time() * 1000 < hold:
+            time.sleep(0.12)
+            continue
+        if clear_since is None:
+            clear_since = time.time()
+        elif time.time() - clear_since >= REST_AFTER_COMBAT_SEC:
+            return s
+        time.sleep(0.12)
+    return snapshot()
 
 
 def wait_out_of_combat(timeout=14.0, settle=None):
@@ -3189,7 +3265,7 @@ def _try_conjure(spell):
     started, err, s = try_cast(spell)
     if is_combat_error(err):
         print("CONJURE blocked combat", err)
-        s = wait_out_of_combat(settle=2.0)
+        s = wait_until_restable(timeout=3.0)
         if attackers(s) or s.get("inCombat") or s.get("dead"):
             return s, False
         started, err, s = try_cast(spell)
@@ -3203,6 +3279,9 @@ def _try_conjure(spell):
 
 def conjure_rations(s, need_food, need_water):
     """Waterbind / Breadbind as soon as combat has dropped. Do this before walking home."""
+    if attackers(s) or s.get("inCombat") or s.get("dead"):
+        return s
+    s = wait_until_restable(timeout=3.0)
     if attackers(s) or s.get("inCombat") or s.get("dead"):
         return s
     if need_water and item_count(s, WATER_PREFIXES) < 1 and (s.get("mana") or 0) >= WATERBIND_COST:
@@ -3311,7 +3390,7 @@ def recover(hp_frac=0.95, mana_frac=0.9):
                         return s
                     if attackers(s) or close_hostiles(s, SIT_CLEAR_YARDS):
                         continue
-            s = wait_out_of_combat(settle=0.6)
+            s = wait_until_restable(timeout=3.5)
         if not s.get("ok") or s.get("dead"):
             return s
         if attackers(s):
@@ -3325,6 +3404,9 @@ def recover(hp_frac=0.95, mana_frac=0.9):
         if not need_food and not need_water:
             return s
         if not is_resting(s):
+            s = wait_until_restable(timeout=3.0)
+            if attackers(s) or s.get("inCombat") or s.get("dead"):
+                continue
             s = conjure_rations(s, need_food, need_water)
             if attackers(s) or s.get("dead") or s.get("inCombat"):
                 continue
@@ -3334,11 +3416,14 @@ def recover(hp_frac=0.95, mana_frac=0.9):
             use_item(food)
         if water and not s.get("drinking"):
             use_item(water)
-        time.sleep(0.15)
+        time.sleep(0.2)
+        s = snapshot()
         err = hud_error()
-        if is_combat_error(err):
-            print("RECOVER blocked combat", err)
-            time.sleep(COMBAT_DROP_SEC)
+        if is_combat_error(err) or (
+            not is_resting(s) and (food or water) and not s.get("eating") and not s.get("drinking")
+        ):
+            print("RECOVER blocked combat", err or "no sit")
+            s = wait_until_restable(timeout=3.0)
             continue
         if "already" in (err or "").lower():
             pass

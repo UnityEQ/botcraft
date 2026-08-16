@@ -438,12 +438,17 @@ def hunt():
         if not mob or mob.get("dead"):
             note("wolf_dead")
             break
-        if should_reset(s):
+        if should_reset(s, finish_mob=mob):
             note("flee_low_hp", {"hp": s.get("hp"), "maxHp": s.get("maxHp"), "wolf": mob.get("hp")})
             attack(False)
             reset_combat(s)
             recover(hp_frac=0.95, mana_frac=0.9)
             return log
+        if hp_frac(s) <= FLEE_HP_FRAC and mob_almost_dead(mob):
+            popped, s = maybe_finish_barrier(s, mob)
+            if popped:
+                used_barrier = True
+                note("bar5_finish", {"hp": s.get("hp"), "wolf": mob.get("hp")})
         s = ensure_hostile_target(wid, s)
         incoming = [e for e in attackers(s) if e.get("id") != wid]
         if incoming:
