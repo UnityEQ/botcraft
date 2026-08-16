@@ -67,40 +67,67 @@ Chrome asks Allow on every *new* debug websocket. Leave the daemon running. Do n
 
 If the daemon died (Allow popup on every command), run `.\scripts\start-daemon.ps1` again and click Allow once.
 
-## Run the wolf loop
+## Run the hunt
 
 1. In Chrome, open [https://worldofclaudecraft.com/](https://worldofclaudecraft.com/).
-2. Log in and enter the world on **your** character. Stay on that tab. The script will not pick a character for you.
-3. From the repo root:
+2. Log in and enter the world on **your** character. Walk to the camp you want. **Home is wherever you are standing when the script starts.**
+3. Leave that tab selected (the Chrome window can sit in the background). From the repo root:
 
    ```powershell
-   .\scripts\run.ps1 examples\woc_hunt_loop.py
+   .\scripts\hunt.ps1
+   .\scripts\hunt.ps1 -Player CharacterName
    ```
 
-4. Stop with **Ctrl+C**. The script releases movement and auto-attack on the way out.
+4. Stop with **Ctrl+C**. Movement and auto-attack are released on the way out. If they keep running: `.\scripts\stop.ps1`.
 
-Optional cap (default is no cap — it hunts until you interrupt):
+`hunt.ps1` is the watchdog. It restarts if Chrome CDP drops. If you **die**, it exits (code 2) and does **not** relaunch — rez, walk back to camp, start it again.
+
+A one-shot without the watchdog:
 
 ```powershell
-$env:WOC_HUNT_ROUNDS = "8"
 .\scripts\run.ps1 examples\woc_hunt_loop.py
 ```
 
-`.\scripts\run.ps1` starts the daemon if it is down, sets `BOTCRAFT_ROOT` so the script can find `examples\woc_lib.py` on any machine, and pipes the file into `browser-use`.
+Optional cap (default is no cap):
+
+```powershell
+$env:WOC_HUNT_ROUNDS = "8"
+.\scripts\hunt.ps1 -Player CharacterName
+```
+
+`.\scripts\run.ps1` starts the daemon if it is down, sets `BOTCRAFT_ROOT` so the script can find `examples\woc_lib.py`, and pipes the file into `browser-use`.
+
+Hunt talks to the tab by target id and does **not** steal OS focus. Leave the ClaudeCraft tab selected; switching to another tab in that window can throttle the game. To restore the old “always grab Chrome” behavior: `$env:WOC_STEAL_FOCUS = "1"`.
 
 ### What one hunt does
 
-- Attaches to the open ClaudeCraft tab (`claudecraft` in the URL)
-- Reads the current player from `window.__game.world.playerId`
-- Recovers if HP/mana are low
-- Fights anything already hitting you
-- Keeps Hoarfrost Mantle and Aether Insight up
-- Picks an isolated **wolf** within 2 levels of you
-- Walks a path that bends around other hostiles
-- Pulls with Cinderbolt, holds Attack (1), extra bolts only if the wolf is still fat
-- Backs off, loots if nothing else is on you, then eats/drinks
+- Binds the open ClaudeCraft tab (`claudecraft` in the URL) and the character already in-world
+- Stamps **home** from your current xyz (per process; another hunt cannot overwrite it)
+- Recovers if HP/mana are low — eats in the **clear**, never sitting inside 24y of a hostile
+- Fights a single hunt-band add; a pack, rare, boss, or low HP is a reset
+- Keeps known self-buffs up (Insight / Mantle if learned)
+- Picks the closest legal hostile in the hunt band (**your level −7 through +1**), preferring mobs within 42y of home (then up to 55y)
+- Skips quest props and scenery that look hostile but are not a fight (Broodmother Eggs, egg-sacs: `xpMult 0`, no damage). Skips bosses
+- Steps out only far enough to tag with **Attack (1)**, kites home, then **Cinderbolt + Blazing Barrier** at the safespot. Does not plant the opener in the camp
+- Extra bolts only while the target is still worth it; plants at home and does not chase
+- Loots if nothing else is on you, then eats/drinks
 
-If you die, the hunt **exits** (code 2) and the watchdog does not relaunch. Rez, then start the hunt again. If it cannot find a target, it waits and retries.
+### Flee and recover
+
+Cloth cannot tank a camp. On adds, a pack, or HP at or below **55%**:
+
+1. Drop auto-attack, Icebind if it will not leech, Blink only if the line is clear
+2. Sprint **away** through a gap — not toward home, and not through the next pack
+3. Stop when NPCs drop chase (`targetId` / `aiState` / evade), just outside the 20y detect clamp
+4. Walk back to the start stamp (allowed out to 90y so a long flee is not “too far”)
+
+If a wanderer hits you while eating, it flees. It does not stand up and tank.
+
+### Chrome getting slow
+
+The game leaks WebGL fire meshes on a long session (JS heap can pass 1 GB). The hunt caches snapshots in-page so it is not walking the world 30×/sec over CDP, but it cannot free meshes already leaked.
+
+When the heap is huge the log prints `CHROME heap … reload the game tab`. Reload the ClaudeCraft tab, log back in, walk to camp, start the hunt again.
 
 Pin a character when more than one ClaudeCraft tab is open:
 
@@ -191,6 +218,7 @@ print(page_info())
 | `scripts\stop-daemon.ps1` | Kill the daemon (next run will prompt Allow again) |
 | `scripts\run.ps1 <file>` | Run a Python file against the live tab |
 | `scripts\hunt.ps1` | Hunt loop with auto-restart (stops if you die). `-Player`, `-Name` |
+| `scripts\stop.ps1` | Clear autorun / held movement if a hunt was killed mid-step |
 | `scripts\map.ps1` | Install or refresh the world-map NPC overlay |
 | `scripts\start-chrome.ps1 -Name alt` | Second Chrome instance for a second hunt |
 
@@ -201,9 +229,13 @@ print(page_info())
 | `browser-use` not found | `$env:PATH = "$env:USERPROFILE\.local\bin;$env:PATH"` then open a new terminal |
 | Allow popup on every click | Daemon died. `.\scripts\start-daemon.ps1`, click Allow once, leave it running |
 | Doctor says Chrome / daemon failed | Start the daemon, enable remote debugging, click Allow once |
-| `World of ClaudeCraft tab not found` | Open the game in Chrome and enter the world first |
-| `Could not find examples/woc_lib.py` | Run from the repo via `.\scripts\run.ps1`, or set `BOTCRAFT_ROOT` to the clone path |
+| `World of ClaudeCraft tab not found` | Open the game in Chrome and enter the world first. A timeout on a busy frame is not “character gone” — leave the bind |
+| `Could not find examples/woc_lib.py` | Run from the repo via `.\scripts\run.ps1` or `.\scripts\hunt.ps1`, or set `BOTCRAFT_ROOT` to the clone path |
 | Character looks wrong | The script uses whoever is already in that tab. Switch characters in the game, then rerun |
+| Chrome keeps jumping in front | Hunt no longer activates the tab. Restart the loop. `$env:WOC_STEAL_FOCUS = "1"` restores the old grab |
+| `SAFESPOT skip too far` after a flee | Should walk home up to 90y now. Restart the loop. If you are still stranded, walk back to camp and start there |
+| `CHROME heap … reload` / hitchy tab | Game WebGL leak. Reload the ClaudeCraft tab, log in, walk to camp, start hunt again |
+| Pulls Broodmother Eggs | Those are quest props (`spider_egg`, no XP/damage). Current hunt skips them as `dummy` |
 
 ```powershell
 .\scripts\check-setup.ps1

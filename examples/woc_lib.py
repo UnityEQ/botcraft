@@ -118,8 +118,12 @@ HOME_WALK_YARDS = 90.0
 HOME_MATCH_YARDS = 40.0
 # Tab this process owns. j() always evaluates here so another hunt cannot steal reads.
 BOUND_TID = None
-# Combat hook is installed once per bind. Reinstalling it every round times out.
+# Combat hook + in-page snapshot pump. Reinstalling every round times out.
 _HOOK_OK = False
+_SNAP_CACHE = None
+_SNAP_CACHE_T = 0.0
+_SNAP_CACHE_TTL = 0.08
+_HEAP_WARN_T = 0.0
 
 
 def _safespot_path(name):
@@ -585,14 +589,30 @@ def _bound_player_ok():
     return False
 
 
-def _bind_tab(tid, name, url):
-    global BOUND_TID, _HOOK_OK
+def _steal_focus_ok():
+    return (os.environ.get("WOC_STEAL_FOCUS") or "").strip().lower() in ("1", "true", "yes")
+
+
+def _focus_tab(tid):
+    """Bring the ClaudeCraft tab (and Chrome) to the front. Off by default."""
+    if not tid or not _steal_focus_ok():
+        return
     try:
         switch_tab(tid)
     except Exception:
-        cdp("Target.activateTarget", targetId=tid)
+        try:
+            cdp("Target.activateTarget", targetId=tid)
+        except Exception:
+            pass
+
+
+def _bind_tab(tid, name, url):
+    global BOUND_TID, _HOOK_OK
+    # Do not switch_tab / activateTarget — that steals OS focus every bind.
+    # js(..., target_id=tid) talks to the tab in the background.
     BOUND_TID = tid
     _HOOK_OK = False
+    _focus_tab(tid)
     try:
         _HOOK_OK = bool(install_combat_hook())
     except Exception:
@@ -607,20 +627,17 @@ def activate_game(retries=8):
     last = None
     want = wanted_player().lower()
     if BOUND_TID:
-        # Keep this hunt on its own tab. Do not re-read the player or
-        # reinstall the combat hook every round — that is what timed out.
-        try:
-            cdp("Target.activateTarget", targetId=BOUND_TID)
-        except Exception:
-            BOUND_TID = None
-            _HOOK_OK = False
-        else:
-            if not _HOOK_OK:
-                try:
-                    _HOOK_OK = bool(install_combat_hook())
-                except Exception:
-                    pass
-            return BOUND_TID
+        # Stay on this target in the background. activateTarget was yanking Chrome
+        # in front of other windows every hunt round.
+        if not _HOOK_OK:
+            try:
+                _HOOK_OK = bool(install_combat_hook())
+            except Exception:
+                BOUND_TID = None
+                _HOOK_OK = False
+            else:
+                return BOUND_TID
+        return BOUND_TID
     for attempt in range(max(1, retries)):
         try:
             tabs = list_tabs(include_chrome=False)
@@ -667,16 +684,20 @@ def activate_game(retries=8):
 
 
 def install_combat_hook():
-    """Catch damage-taken the same frame the combat log writes 'X hits you'."""
+    """Install the combat hook and the in-page snapshot pump once."""
+    return install_page_helpers()
+
+
+def install_page_helpers():
+    """Hook combat events and build snapshots inside the page so CDP does not walk the world 30x/sec."""
     global _HOOK_OK
-    if _HOOK_OK:
-        return True
     ok = j(
         r"""
 (() => {
   const g = window.__game;
   if (!g || !g.hud || !g.hud.handleEvents) return false;
-  if (window.__wocCombat && window.__wocCombat.hooked === g.hud.handleEvents) return true;
+  const already = window.__wocCombat && window.__wocCombat.hooked === g.hud.handleEvents;
+  if (!already) {
   const orig = g.hud.handleEvents.bind(g.hud);
   const state = { hooked: null, incoming: [], lastEventAt: 0 };
   const wrapped = function(events) {
@@ -703,6 +724,97 @@ def install_combat_hook():
   g.hud.handleEvents = wrapped;
   state.hooked = wrapped;
   window.__wocCombat = state;
+  }
+  if (!window.__wocPump) {
+    const build = () => {
+      const gg = window.__game;
+      if (!gg || !gg.world) return { ok: false };
+      const ww = gg.world;
+      const pl = ww.entities.get(ww.playerId);
+      if (!pl) return { ok: false };
+      const px = pl.pos.x, py = pl.pos.y, pz = pl.pos.z;
+      const ents = [];
+      ww.entities.forEach((e) => {
+        if (!e || e.id === ww.playerId) return;
+        const k = e.kind;
+        if (k !== 'mob' && k !== 'npc') return;
+        const ep = e.pos || {};
+        const x = ep.x ?? 0, z = ep.z ?? 0;
+        const d = Math.hypot(x - px, z - pz);
+        if (d > 90) return;
+        ents.push({
+          id: e.id, kind: k, name: e.name, level: e.level,
+          hp: e.hp, maxHp: e.maxHp, dead: !!e.dead, hostile: !!e.hostile,
+          templateId: e.templateId || null,
+          x: Math.round(x * 100) / 100,
+          y: Math.round((ep.y ?? 0) * 100) / 100,
+          z: Math.round(z * 100) / 100,
+          dist: Math.round(d * 100) / 100,
+          targetId: e.targetId || null,
+          aggroTargetId: e.aggroTargetId || null,
+          inCombat: !!e.inCombat,
+          aiState: e.aiState || null,
+          evadeEpoch: e.evadeEpoch || 0
+        });
+      });
+      ents.sort((a, b) => a.dist - b.dist);
+      const now = Date.now();
+      const hk = window.__wocCombat || { incoming: [] };
+      const hitByIds = [];
+      const incoming = hk.incoming || [];
+      for (let i = incoming.length - 1; i >= 0; i--) {
+        const h = incoming[i];
+        if (!h || now - (h.t || 0) >= 8000) continue;
+        if (h.sourceId != null && hitByIds.indexOf(h.sourceId) < 0) hitByIds.push(h.sourceId);
+      }
+      const cds = {};
+      if (pl.cooldowns && typeof pl.cooldowns.forEach === 'function') {
+        pl.cooldowns.forEach((v, k) => { cds[k] = Math.round((v || 0) * 100) / 100; });
+      }
+      const logEl = gg.hud && gg.hud.combatLogEl;
+      if (logEl && logEl.children.length > 80) {
+        while (logEl.children.length > 40) logEl.removeChild(logEl.firstChild);
+      }
+      return {
+        ok: true,
+        id: pl.id, name: pl.name, level: pl.level,
+        hp: pl.hp, maxHp: pl.maxHp,
+        mana: pl.resource, maxMana: pl.maxResource,
+        dead: !!pl.dead, sitting: !!pl.sitting, eating: !!pl.eating, drinking: !!pl.drinking,
+        x: Math.round(px * 100) / 100,
+        y: Math.round(py * 100) / 100,
+        z: Math.round(pz * 100) / 100,
+        facing: pl.facing, targetId: pl.targetId,
+        xp: ww.xp, copper: ww.copper,
+        auras: (pl.auras || []).map((a) => ({
+          id: a.id,
+          remaining: Math.round((a.remaining || 0) * 10) / 10
+        })),
+        autoAttack: !!pl.autoAttack,
+        inCombat: !!pl.inCombat,
+        combatExitHoldUntil: pl.combatExitHoldUntil || 0,
+        gcdRemaining: Math.round((pl.gcdRemaining || 0) * 100) / 100,
+        castingAbility: pl.castingAbility || null,
+        castRemaining: Math.round((pl.castRemaining || 0) * 100) / 100,
+        swingTimer: Math.round((pl.swingTimer || 0) * 100) / 100,
+        cooldowns: cds,
+        inventory: (ww.inventory || []).map((it) => ({
+          id: it.itemId || it.id,
+          count: it.count || it.qty || 0
+        })),
+        hitByIds,
+        hitByNames: [],
+        lastHitAt: hk.lastEventAt || 0,
+        heapMB: (performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : 0),
+        ents
+      };
+    };
+    const tick = () => {
+      try { window.__wocSnap = build(); } catch (e) { window.__wocSnap = { ok: false }; }
+    };
+    window.__wocPump = setInterval(tick, 100);
+    tick();
+  }
   return true;
 })()
 """
@@ -982,8 +1094,36 @@ _SNAPSHOT_LITE_JS = r"""
 """
 
 
+def _note_heap(data):
+    global _HEAP_WARN_T
+    heap = (data or {}).get("heapMB") or 0
+    if heap < 900:
+        return
+    now = time.time()
+    if now - _HEAP_WARN_T < 60:
+        return
+    _HEAP_WARN_T = now
+    print(
+        "CHROME heap",
+        heap,
+        "MB — game WebGL is leaking meshes. Reload the ClaudeCraft tab when you can.",
+    )
+
+
 def _snapshot_raw():
     try:
+        pumped = j("window.__wocSnap || null")
+        if pumped and pumped.get("ok"):
+            return pumped
+    except Exception as err:
+        if not _is_eval_timeout(err):
+            raise
+    try:
+        if not _HOOK_OK:
+            install_page_helpers()
+        pumped = j("window.__wocSnap || null")
+        if pumped and pumped.get("ok"):
+            return pumped
         return j(_SNAPSHOT_JS) or {"ok": False}
     except Exception as err:
         if not _is_eval_timeout(err):
@@ -1000,25 +1140,35 @@ def _snapshot_raw():
 
 def snapshot():
     """Read this hunt's character only. A leaked snapshot from another tab walks us to their xyz."""
+    global _SNAP_CACHE, _SNAP_CACHE_T
+    now = time.time()
+    if (
+        _SNAP_CACHE
+        and _SNAP_CACHE.get("ok")
+        and (now - _SNAP_CACHE_T) < _SNAP_CACHE_TTL
+    ):
+        return _SNAP_CACHE
     data = _snapshot_raw()
     if data and data.get("reason") == "timeout":
         return data
     want = _name_key(wanted_player()) or _name_key(SAFESPOT_OWNER)
     if not want:
+        if data and data.get("ok"):
+            _SNAP_CACHE, _SNAP_CACHE_T = data, now
+            _note_heap(data)
         return data or {"ok": False}
     if data and data.get("ok") and _name_key(data.get("name")) == want:
+        _SNAP_CACHE, _SNAP_CACHE_T = data, now
+        _note_heap(data)
         return data
     print(
         "SNAPSHOT wrong player",
         json.dumps({"name": (data or {}).get("name"), "want": want, "bound": bool(BOUND_TID)}),
     )
     if BOUND_TID:
-        try:
-            cdp("Target.activateTarget", targetId=BOUND_TID)
-        except Exception:
-            pass
         data = _snapshot_raw()
         if data and data.get("ok") and _name_key(data.get("name")) == want:
+            _SNAP_CACHE, _SNAP_CACHE_T = data, now
             return data
         if data and data.get("reason") == "timeout":
             return data
@@ -1057,6 +1207,14 @@ def away_from_own_home(s):
 
 
 def entity(eid):
+    if (
+        _SNAP_CACHE
+        and _SNAP_CACHE.get("ok")
+        and (time.time() - _SNAP_CACHE_T) < 0.2
+    ):
+        for e in _SNAP_CACHE.get("ents") or []:
+            if e.get("id") == eid:
+                return e
     try:
         return j(
         f"""
