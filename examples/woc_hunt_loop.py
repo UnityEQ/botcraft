@@ -1,6 +1,7 @@
 # Isolated hunts forever until you hit Ctrl+C.
 # Hunt-band hostiles (player-7..+1), or only HUNT_NAME if that is set.
-# Tag with Attack (1), kite home, then Cinderbolt + absorb (bar 5, bar 6 if 5 is down).
+# Tag with Attack (1), kite home, then bar 7 fire amp + Cinderbolt + Blazing Barrier (5).
+# Mass Barrier (6) only if 5 is on cooldown and the shield buff is gone.
 # Run: .\scripts\run.ps1 examples\woc_hunt_loop.py
 #
 # Uses whichever character is already in the World of ClaudeCraft tab.
@@ -405,7 +406,7 @@ def hunt():
             face(face_to(mob["x"], mob["z"], s["x"], s["z"]))
             stop()
 
-    # Fight at home: Cinderbolt, then bar 5 absorb (bar 6 if 5 is down).
+    # Fight at home: Cinderbolt, then Blazing Barrier.
     ok_cinder, err_cinder, used_barrier, err5, s = home_cinder_then_barrier(wid)
     note(
         "home_opener",
@@ -449,6 +450,7 @@ def hunt():
             if popped:
                 used_barrier = True
                 note("absorb_finish", {"hp": s.get("hp"), "wolf": mob.get("hp")})
+        # Shield before another bolt. 5 if ready, 6 if 5 is on cooldown and the buff is gone.
         if (not casting_or_gcd(s)) and not has_absorb(s):
             started_abs, err_abs, used_abs, s = press_absorb(s, wait=False)
             if started_abs:
