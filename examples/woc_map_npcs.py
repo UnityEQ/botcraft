@@ -2,6 +2,7 @@
 # Edit this file, then run it to update the open game tab. Hunt never installs this.
 #
 #   .\scripts\map.ps1
+#   .\scripts\map.ps1 -Name salty -Player salty
 #   .\scripts\run.ps1 examples\woc_map_npcs.py
 #
 # Square color is mob level vs the player:
@@ -18,19 +19,65 @@ MAP_NPC_JS = r"""
   const g = window.__game;
   const hud = g && g.hud;
   const painter = hud && hud.mapPainter;
-  if (!hud || !painter || typeof painter.draw !== 'function') return false;
+  const canPaintOW = !!(painter && typeof painter.paintOverworld === 'function');
+  const canDraw = !!(painter && typeof painter.draw === 'function');
+  if (!hud || !painter || (!canPaintOW && !canDraw)) return false;
   const prev = window.__wocMapNpcs || {};
   const hudProto = Object.getPrototypeOf(hud);
   if (typeof hudProto.updateMapWindow === 'function') {
     hud.updateMapWindow = hudProto.updateMapWindow.bind(hud);
   }
-  const nativeDraw = prev.nativeDraw || painter.draw.bind(painter);
+  // v0.38 made draw() take a 6th profile arg. An older wrap that only
+  // forwarded 5 args made MAP_PAINT_GEOMETRY[undefined] throw and the
+  // zone map never finished. Prefer paintOverworld (what Hud calls).
+  if (prev.nativeDraw) {
+    try { painter.draw = prev.nativeDraw; } catch (e) {}
+  }
+  if (prev.nativePaintOverworld) {
+    try { painter.paintOverworld = prev.nativePaintOverworld; } catch (e) {}
+  }
+  const nativePaintOverworld = canPaintOW ? painter.paintOverworld.bind(painter) : null;
+  const nativeDraw = canDraw ? painter.draw.bind(painter) : null;
   const MARK = 12;
   const HIT_R = 18;
+  function regionOf(v) {
+    if (!v) return null;
+    const minX = v.minX ?? v.xMin;
+    const maxX = v.maxX ?? v.xMax;
+    const minZ = v.minZ ?? v.zMin;
+    const maxZ = v.maxZ ?? v.zMax;
+    if (minX == null || maxX == null || minZ == null || maxZ == null) return null;
+    return { minX, maxX, minZ, maxZ };
+  }
+  // paintOverworld().view keeps FULL-zone min/max and only shrinks spanX/spanZ
+  // when zoomed. The painter composites with model.region (the visible square).
+  function visibleRegion(modelOrView, opts) {
+    if (modelOrView && modelOrView.region) return regionOf(modelOrView.region);
+    const view = (modelOrView && modelOrView.view) || modelOrView;
+    const r = regionOf(view);
+    if (!r) return null;
+    const fullX = r.maxX - r.minX, fullZ = r.maxZ - r.minZ;
+    const spanX = (view && view.spanX) || fullX;
+    const spanZ = (view && view.spanZ) || fullZ;
+    if (!(spanX < fullX - 0.01 || spanZ < fullZ - 0.01)) return r;
+    const p = g.world && g.world.entities.get(g.world.playerId);
+    const center = (opts && opts.center) || (hud && hud.mapCenter);
+    const baseX = (center && center.x) ?? (p && p.pos && p.pos.x);
+    const baseZ = (center && center.z) ?? (p && p.pos && p.pos.z);
+    if (baseX == null || baseZ == null) return r;
+    const cx = Math.max(r.minX + spanX / 2, Math.min(r.maxX - spanX / 2, baseX));
+    const cz = Math.max(r.minZ + spanZ / 2, Math.min(r.maxZ - spanZ / 2, baseZ));
+    return {
+      minX: cx - spanX / 2, maxX: cx + spanX / 2,
+      minZ: cz - spanZ / 2, maxZ: cz + spanZ / 2
+    };
+  }
   function worldToMap(x, z, v, n) {
-    const dx = v.maxX - v.minX, dz = v.maxZ - v.minZ;
+    const r = regionOf(v) || visibleRegion(v);
+    if (!r) return null;
+    const dx = r.maxX - r.minX, dz = r.maxZ - r.minZ;
     if (!dx || !dz) return null;
-    return { mx: (v.maxX - x) / dx * n, my: (v.maxZ - z) / dz * n };
+    return { mx: (r.maxX - x) / dx * n, my: (r.maxZ - z) / dz * n };
   }
   function colorFor(e) {
     const w = g.world;
@@ -157,19 +204,49 @@ MAP_NPC_JS = r"""
       state.hoverBound = true;
     }
   }
-  const wrappedDraw = function(e, t, nbg, r, i) {
-    const ret = nativeDraw(e, t, nbg, r, i);
+  function afterPaint(ctx, region, size) {
     try {
-      if (t && t.region && e && e.canvas && e.canvas.id === 'map-canvas') {
-        paint(e, t.region, r || e.canvas.width);
+      const vis = visibleRegion(region) || regionOf(region);
+      if (ctx && ctx.canvas && ctx.canvas.id === 'map-canvas' && vis) {
+        if (window.__wocMapNpcs) window.__wocMapNpcs.lastRegion = vis;
+        paint(ctx, vis, size || ctx.canvas.width);
       }
       bindHover();
     } catch (err) {}
-    return ret;
-  };
-  painter.draw = wrappedDraw;
+  }
+  let hooked = null;
+  let via = null;
+  // draw() is the zoom-correct hook: its model.region is the visible square.
+  // Forward every arg — v0.38 added a 6th profile. paintOverworld().view is
+  // the full-zone frame and must not be used for projection.
+  if (nativeDraw) {
+    const wrappedDraw = function() {
+      const ret = nativeDraw.apply(painter, arguments);
+      try {
+        const ctx = arguments[0];
+        const model = arguments[1];
+        const size = arguments[3] || (ctx && ctx.canvas && ctx.canvas.width);
+        afterPaint(ctx, model, size);
+      } catch (err) {}
+      return ret;
+    };
+    painter.draw = wrappedDraw;
+    hooked = wrappedDraw;
+    via = 'draw';
+  } else if (nativePaintOverworld) {
+    const wrappedPaintOverworld = function(ctx, world, opts) {
+      const ret = nativePaintOverworld(ctx, world, opts);
+      const n = (opts && opts.canvasSize) || (ctx && ctx.canvas && ctx.canvas.width);
+      afterPaint(ctx, visibleRegion(ret, opts), n);
+      return ret;
+    };
+    painter.paintOverworld = wrappedPaintOverworld;
+    hooked = wrappedPaintOverworld;
+    via = 'paintOverworld';
+  }
   window.__wocMapNpcs = Object.assign(prev || {}, {
-    nativeDraw, hooked: wrappedDraw, paint, hits: [], hovering: false
+    nativeDraw, nativePaintOverworld, hooked, via,
+    paint, hits: [], hovering: false, lastRegion: null
   });
   try { hud.updateMapWindow(); } catch (err) {}
   return true;
@@ -225,6 +302,7 @@ def apply_overlay():
   }
   return {
     hooked: typeof s.paint === 'function',
+    via: s.via || null,
     mapOpen,
     painted: (s.hits || []).length,
     living,
