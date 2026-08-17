@@ -423,7 +423,7 @@ def hunt():
 
     t0 = time.time()
     reon = False
-    while time.time() - t0 < 16:
+    while time.time() - t0 < FIGHT_MAX_S:
         s = snapshot()
         mob = entity(wid)
         if s.get("ok") and not snapshot_is_ours(s):
@@ -493,7 +493,7 @@ def hunt():
             reon = True
             note("autoattack_reon", {"dist": mob["dist"], "hp": mob["hp"]})
         hp = mob.get("hp") or 0
-        if (not casting_or_gcd(s)) and pick_damage_spell(s, mob) and bolts < 4:
+        if (not casting_or_gcd(s)) and pick_damage_spell(s, mob):
             spell, ok, err = press_damage(wid, mob, s, planted=True)
             if ok:
                 bolts += 1
@@ -520,8 +520,6 @@ def hunt():
     stop()
     mob = entity(wid)
     s = snapshot()
-    if not attackers(s):
-        attack(False)
     note(
         "fight_over",
         {
@@ -534,24 +532,44 @@ def hunt():
         },
     )
 
-    # A leftover attacker after the kill is a pack leech. Run, do not tank it.
-    aggro = attackers(s)
-    if aggro:
-        note(
-            "flee_after_fight",
-            [{"id": a.get("id"), "name": a.get("name"), "dist": a.get("dist"), "hp": a.get("hp")} for a in aggro],
-        )
-        attack(False)
-        if should_reset(s, aggro) or len(aggro) >= 2:
-            reset_combat(s)
-            recover(hp_frac=0.95, mana_frac=0.9)
-            return log
-        s, killed = defend()
-        note("defended", {"killed": killed, "hp": s.get("hp")})
+    # Same 1v1 still up: keep fighting. Do not sit or drop auto-attack.
+    extras = [e for e in attackers(s) if e.get("id") != wid]
+    if mob and not mob.get("dead") and not extras and not should_reset(s, finish_mob=mob):
+        note("fight_continue", {"hp": mob.get("hp"), "dist": mob.get("dist"), "mana": s.get("mana")})
+        keep_autoattack(s)
+        s, dead_mob, why = fight_entity(wid)
+        note("fight_continue_over", {"why": why, "hp": s.get("hp"), "wolf": dead_mob})
         if s.get("dead"):
             note("we_died", {"hp": s["hp"]})
             return log
-        mob = entity(wid)
+        if why == "dead":
+            note("wolf_dead")
+        if why == "fled":
+            recover(hp_frac=0.95, mana_frac=0.9)
+            return log
+        mob = dead_mob or entity(wid)
+        s = snapshot()
+
+    # Extra attackers after the kill are a pack leech. Run, do not tank them.
+    aggro = attackers(s)
+    if aggro:
+        leftover = [a for a in aggro if not mob or a.get("id") != mob.get("id") or mob.get("dead")]
+        if leftover or (mob and not mob.get("dead") and len(aggro) >= 2):
+            note(
+                "flee_after_fight",
+                [{"id": a.get("id"), "name": a.get("name"), "dist": a.get("dist"), "hp": a.get("hp")} for a in aggro],
+            )
+            attack(False)
+            if should_reset(s, aggro) or len(aggro) >= 2:
+                reset_combat(s)
+                recover(hp_frac=0.95, mana_frac=0.9)
+                return log
+            s, killed = defend()
+            note("defended", {"killed": killed, "hp": s.get("hp")})
+            if s.get("dead"):
+                note("we_died", {"hp": s["hp"]})
+                return log
+            mob = entity(wid)
 
     extras = adds_on_us(s, ignore_id=wid, radius=12)
     if mob and mob.get("dead") and not extras and not attackers(s):
@@ -562,7 +580,11 @@ def hunt():
     else:
         note("skip_loot", {"adds": extras})
 
-    recover(hp_frac=0.95, mana_frac=0.9)
+    still_up = bool(mob and not mob.get("dead") and (mob.get("dist") or 99) < 24)
+    if still_up or attackers(s) or s.get("inCombat"):
+        note("skip_recover_in_combat", {"wolf": None if not mob else mob.get("hp"), "adds": len(attackers(s))})
+    else:
+        recover(hp_frac=0.95, mana_frac=0.9)
     s = snapshot()
     note("done", {"hp": s["hp"], "mana": s["mana"], "xp": s["xp"], "pos": [s["x"], s["z"]]})
     return log

@@ -52,6 +52,8 @@ ABSORB_COST = {
 # Rank-1 Cinderbolt is 16-25 + 2 DoT. Rimelance is 18-20. Don't spend 30 mana on a dying mob.
 BOLT_OVERKILL_HP = 22
 BOLT_THIRD_HP = 40
+# Stay in the planted fight until the mob dies, we reset, or this cap.
+FIGHT_MAX_S = 48.0
 MANTLE_COST = 20
 INSIGHT_COST = 25
 BREADBIND_COST = 45
@@ -1627,8 +1629,10 @@ def under_attack(s=None):
     return bool(attackers(s))
 
 
-def fight_entity(eid, max_s=22.0):
+def fight_entity(eid, max_s=None):
     """Kill one mob already on us. Plant at the safespot — do not chase."""
+    if max_s is None:
+        max_s = FIGHT_MAX_S
     stop()
     target(eid)
     attack(True)
@@ -1661,7 +1665,7 @@ def fight_entity(eid, max_s=22.0):
             started_abs, err_abs, used_abs, s = press_absorb(s, wait=False)
             if started_abs:
                 print("ABSORB refresh", json.dumps({"spell": used_abs, "hp": s.get("hp"), "err": err_abs or None}))
-        want = (not casting_or_gcd(s)) and pick_damage_spell(s, mob) and bolts < 4
+        want = (not casting_or_gcd(s)) and pick_damage_spell(s, mob)
         if want:
             spell, ok, err = press_damage(eid, mob, s, planted=True)
             if ok:

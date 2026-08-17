@@ -109,7 +109,7 @@ Hunt talks to the tab by target id and does **not** steal OS focus. Leave the Cl
 - Picks the closest legal hostile in the hunt band (**your level −7 through +1**), preferring mobs within 42y of home (then up to 55y)
 - Skips quest props and scenery that look hostile but are not a fight (Broodmother Eggs, egg-sacs: `xpMult 0`, no damage). Skips bosses
 - Steps out only far enough to tag with **Attack (1)**, kites home, then **fire amp (7) + Cinderbolt + Blazing Barrier (5)** at the safespot. **Mass Barrier (6)** only if 5 is on cooldown and the shield is gone. Does not plant the opener in the camp
-- Extra bolts only while the target is still worth it; plants at home and does not chase
+- Keeps bolting at home until the target dies or a reset; does not stop after a short timer or a fixed bolt count
 - Loots if nothing else is on you, then eats/drinks
 
 ### Flee and recover
