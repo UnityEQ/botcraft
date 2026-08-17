@@ -1,6 +1,6 @@
 # Isolated hunts forever until you hit Ctrl+C.
 # Hunt-band hostiles (player-7..+1), or only HUNT_NAME if that is set.
-# Tag with Attack (1), kite home, then Cinderbolt + Blazing Barrier at the safespot.
+# Tag with Attack (1), kite home, then Cinderbolt + absorb (bar 5, bar 6 if 5 is down).
 # Run: .\scripts\run.ps1 examples\woc_hunt_loop.py
 #
 # Uses whichever character is already in the World of ClaudeCraft tab.
@@ -405,7 +405,7 @@ def hunt():
             face(face_to(mob["x"], mob["z"], s["x"], s["z"]))
             stop()
 
-    # Fight at home: Cinderbolt, then Blazing Barrier.
+    # Fight at home: Cinderbolt, then bar 5 absorb (bar 6 if 5 is down).
     ok_cinder, err_cinder, used_barrier, err5, s = home_cinder_then_barrier(wid)
     note(
         "home_opener",
@@ -448,7 +448,12 @@ def hunt():
             popped, s = maybe_finish_barrier(s, mob)
             if popped:
                 used_barrier = True
-                note("bar5_finish", {"hp": s.get("hp"), "wolf": mob.get("hp")})
+                note("absorb_finish", {"hp": s.get("hp"), "wolf": mob.get("hp")})
+        if (not casting_or_gcd(s)) and not has_absorb(s):
+            started_abs, err_abs, used_abs, s = press_absorb(s, wait=False)
+            if started_abs:
+                used_barrier = True
+                note("absorb_refresh", {"spell": used_abs, "hp": s.get("hp"), "err": err_abs or None})
         s = ensure_hostile_target(wid, s)
         incoming = [e for e in attackers(s) if e.get("id") != wid]
         if incoming:
@@ -502,7 +507,7 @@ def hunt():
                 if spell == CINDERBOLT and not used_barrier:
                     started5, err5, _s = after_first_cinderbolt()
                     used_barrier = True
-                    note("bar5_blazing_barrier", {"started": started5, "err": err5 or None})
+                    note("absorb_after_cinder", {"started": started5, "err": err5 or None})
             else:
                 if err == "unknown_ability" or is_unknown_ability_error(err):
                     mark_unknown_ability(spell)

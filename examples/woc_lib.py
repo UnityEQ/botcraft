@@ -15,6 +15,8 @@ RIMELANCE = "frostbolt"
 ICEBIND = "frost_nova"
 BLINK = "blink"
 BLAZING_BARRIER = "blazing_barrier"
+ICE_BARRIER = "ice_barrier"
+TEMPORAL_BARRIER = "temporal_barrier"
 MANTLE = "frost_armor"
 INSIGHT = "arcane_intellect"
 BREADBIND = "conjure_food"
@@ -24,7 +26,8 @@ WATER = "spring_water"
 FOOD_PREFIXES = ("conjured_bread", "baked_bread")
 WATER_PREFIXES = ("conjured_water", "spring_water")
 
-# Fight buttons: 1 Attack, 3 Cinderbolt, 4 Icebind, 5 Blazing Barrier.
+# Fight buttons: 1 Attack, 3 Cinderbolt, 4 Icebind, 5 Blazing Barrier,
+# 6 fallback absorb (Frostveil / whatever is on that slot).
 # Do not press bar 2. Frostbolt is off the bar.
 CINDERBOLT_COST = 65
 CINDERBOLT_CAST = 2.5
@@ -32,7 +35,15 @@ RIMELANCE_COST = 35
 RIMELANCE_CAST = 2.0
 ICEBIND_COST = 35
 ICEBIND_RADIUS = 10.0
-BLAZING_BARRIER_COST = 65
+BLAZING_BARRIER_COST = 45
+ICE_BARRIER_COST = 45
+TEMPORAL_BARRIER_COST = 50
+ABSORB_IDS = (BLAZING_BARRIER, ICE_BARRIER, TEMPORAL_BARRIER)
+ABSORB_COST = {
+    BLAZING_BARRIER: BLAZING_BARRIER_COST,
+    ICE_BARRIER: ICE_BARRIER_COST,
+    TEMPORAL_BARRIER: TEMPORAL_BARRIER_COST,
+}
 # Rank-1 Cinderbolt is 16-25 + 2 DoT. Rimelance is 18-20. Don't spend 30 mana on a dying mob.
 BOLT_OVERKILL_HP = 22
 BOLT_THIRD_HP = 40
@@ -79,13 +90,13 @@ NORMAL_KEEP = 10.0
 DANGER_KEEP = 22.0
 # Never open a pull below this fraction of max HP.
 MIN_PULL_HP_FRAC = 0.9
-# Cloth cannot finish a hard cast below this. Run, do not tank —
-# unless the current target is already in execute range.
-FLEE_HP_FRAC = 0.55
+# Cloth stands and fights until this. Only HP-flee below 10%.
+# Packs / rares / bosses still run regardless of HP.
+FLEE_HP_FRAC = 0.10
 # Stay in a 1v1 if the mob is this hurt (one bolt / a few wand swings).
 FINISH_HP = 40
-# If we are this low, flee even if the mob is dying — unless we have Barrier.
-PANIC_HP_FRAC = 0.2
+# Below this, even a dying 1v1 is a reset unless an absorb shield is up.
+PANIC_HP_FRAC = 0.05
 # Do not sit inside the 20y aggro clamp.
 SIT_CLEAR_YARDS = 24.0
 # Hunt band: player-7 through player+1.
@@ -730,6 +741,10 @@ def install_page_helpers():
   state.hooked = wrapped;
   window.__wocCombat = state;
   }
+  if (window.__wocPump && window.__wocPumpVer !== 2) {
+    try { clearInterval(window.__wocPump); } catch (e) {}
+    window.__wocPump = null;
+  }
   if (!window.__wocPump) {
     const build = () => {
       const gg = window.__game;
@@ -793,8 +808,12 @@ def install_page_helpers():
         xp: ww.xp, copper: ww.copper,
         auras: (pl.auras || []).map((a) => ({
           id: a.id,
+          kind: a.kind || null,
+          name: a.name || null,
+          value: Math.round((a.value || 0) * 10) / 10,
           remaining: Math.round((a.remaining || 0) * 10) / 10
         })),
+        absorb: Math.round((pl.auras || []).reduce((n, a) => n + (a.kind === 'absorb' ? (a.value || 0) : 0), 0) * 10) / 10,
         autoAttack: !!pl.autoAttack,
         inCombat: !!pl.inCombat,
         combatExitHoldUntil: pl.combatExitHoldUntil || 0,
@@ -818,6 +837,7 @@ def install_page_helpers():
       try { window.__wocSnap = build(); } catch (e) { window.__wocSnap = { ok: false }; }
     };
     window.__wocPump = setInterval(tick, 100);
+    window.__wocPumpVer = 2;
     tick();
   }
   return true;
@@ -1143,12 +1163,13 @@ def _snapshot_raw():
         return {"ok": False, "reason": "timeout"}
 
 
-def snapshot():
+def snapshot(fresh=False):
     """Read this hunt's character only. A leaked snapshot from another tab walks us to their xyz."""
     global _SNAP_CACHE, _SNAP_CACHE_T
     now = time.time()
     if (
-        _SNAP_CACHE
+        not fresh
+        and _SNAP_CACHE
         and _SNAP_CACHE.get("ok")
         and (now - _SNAP_CACHE_T) < _SNAP_CACHE_TTL
     ):
@@ -1495,7 +1516,7 @@ def mob_almost_dead(mob):
 def should_reset(s, aggro=None, finish_mob=None):
     """True if standing to fight will get us killed.
 
-    A 1v1 on a dying mob is not a reset — finish it, and Barrier if we can.
+    HP only resets below 10%. A dying 1v1 with an absorb up can finish.
     Packs / rares / bosses still run.
     """
     if not s or not s.get("ok") or s.get("dead"):
@@ -1509,25 +1530,28 @@ def should_reset(s, aggro=None, finish_mob=None):
         finish_mob
         and mob_almost_dead(finish_mob)
         and len(aggro or []) <= 1
-        and (hp_frac(s) > PANIC_HP_FRAC or has_aura(s, BLAZING_BARRIER))
+        and (hp_frac(s) > PANIC_HP_FRAC or has_absorb(s))
     ):
         return False
     return True
 
 
 def maybe_finish_barrier(s, mob):
-    """Pop Blazing Barrier while we stay to finish a dying 1v1."""
+    """Pop bar 5, or bar 6 if 5 is down, while we stay to finish a dying 1v1."""
     if not s or not mob or mob.get("dead"):
         return False, s
     if hp_frac(s) > FLEE_HP_FRAC:
         return False, s
     if not mob_almost_dead(mob):
         return False, s
-    if has_aura(s, BLAZING_BARRIER):
+    if has_absorb(s):
         return False, s
-    started, err, s = press_blazing_barrier(s)
+    started, err, used, s = press_absorb(s)
     if started:
-        print("BAR5 finish", json.dumps({"hp": s.get("hp"), "wolf": mob.get("hp"), "err": err or None}))
+        print(
+            "ABSORB finish",
+            json.dumps({"spell": used, "hp": s.get("hp"), "wolf": mob.get("hp"), "err": err or None}),
+        )
     return bool(started), s
 
 
@@ -1628,6 +1652,10 @@ def fight_entity(eid, max_s=22.0):
         ang = face_to(mob["x"], mob["z"], s["x"], s["z"])
         face(ang)
         d = mob.get("dist") or 0
+        if (not casting_or_gcd(s)) and not has_absorb(s):
+            started, err, used, s = press_absorb(s, wait=False)
+            if started:
+                print("ABSORB mid_fight", json.dumps({"spell": used, "hp": s.get("hp"), "err": err or None}))
         want = (not casting_or_gcd(s)) and pick_damage_spell(s, mob) and bolts < 4
         if want:
             spell, ok, err = press_damage(eid, mob, s, planted=True)
@@ -2513,30 +2541,211 @@ def press_damage(eid, mob, s=None, max_los_tries=3, planted=True):
     return spell, started, err
 
 
-def press_blazing_barrier(s=None):
-    """Bar 5. Instant self shield. Press after the first Cinderbolt of a pull."""
+_ABSORB_LOCK_UNTIL = 0.0
+_ABSORB_LOCK_ID = None
+
+
+def _clear_snap_cache():
+    global _SNAP_CACHE, _SNAP_CACHE_T
+    _SNAP_CACHE = None
+    _SNAP_CACHE_T = 0.0
+
+
+def _note_absorb_cast(aid):
+    """Remember we just put a shield up so a stale snapshot cannot fire bar 6."""
+    global _ABSORB_LOCK_UNTIL, _ABSORB_LOCK_ID
+    _ABSORB_LOCK_UNTIL = time.time() + 2.5
+    _ABSORB_LOCK_ID = aid
+    _clear_snap_cache()
+
+
+def _aura_is_absorb(aura):
+    if not aura:
+        return False
+    if (aura.get("kind") or "") == "absorb" and (aura.get("value") or 0) > 0:
+        return True
+    aid = str(aura.get("id") or "")
+    if not aid:
+        return False
+    if aid in ABSORB_IDS or "barrier" in aid or aid.endswith("_shield"):
+        return True
+    return False
+
+
+def has_absorb(s=None):
+    """True if any damage-absorb shield is already up."""
+    if _ABSORB_LOCK_UNTIL and time.time() < _ABSORB_LOCK_UNTIL:
+        return True
     s = s or snapshot()
-    if not knows_ability(BLAZING_BARRIER):
+    if (s.get("absorb") or 0) > 0:
+        return True
+    return any(_aura_is_absorb(a) for a in s.get("auras") or [])
+
+
+def _read_action_bar():
+    """Visible hotbar ability ids keyed by slot 1-9. Empty dict if the HUD is dark."""
+    raw = (
+        j(
+            r"""
+(() => {
+  const g = window.__game;
+  const hud = g && g.hud;
+  const ctrl =
+    (hud && (hud.actionBarController || hud.actionBar || hud.hotbar)) ||
+    (g && (g.actionBarController || g.actionBar));
+  const out = {};
+  const take = (slot, a) => {
+    if (!a) return;
+    const id = typeof a === 'string' ? a : (a.type === 'ability' ? a.id : null);
+    if (id) out[String(slot)] = String(id);
+  };
+  if (ctrl && typeof ctrl.actionForSlot === 'function') {
+    for (let slot = 1; slot <= 9; slot++) take(slot, ctrl.actionForSlot(slot));
+    return out;
+  }
+  const actions = ctrl && ctrl.actions;
+  if (Array.isArray(actions)) {
+    actions.forEach((a, i) => take(i + 1, a));
+    return out;
+  }
+  return out;
+})()
+"""
+        )
+        or {}
+    )
+    slots = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                slots[int(k)] = str(v)
+            except (TypeError, ValueError):
+                continue
+    return slots
+
+
+_BAR_CACHE = None
+_BAR_CACHE_T = 0.0
+
+
+def bar_ability(slot):
+    """Ability id on visible hotbar slot (1-9), or None."""
+    global _BAR_CACHE, _BAR_CACHE_T
+    now = time.time()
+    if _BAR_CACHE is None or now - _BAR_CACHE_T > 8.0:
+        try:
+            _BAR_CACHE = _read_action_bar()
+        except Exception:
+            _BAR_CACHE = {}
+        _BAR_CACHE_T = now
+    return (_BAR_CACHE or {}).get(int(slot))
+
+
+def absorb_bar5():
+    return bar_ability(5) or BLAZING_BARRIER
+
+
+def absorb_bar6():
+    """Bar 6 absorb. Prefer whatever is actually on the slot."""
+    slotted = bar_ability(6)
+    if slotted:
+        return slotted
+    if knows_ability(ICE_BARRIER):
+        return ICE_BARRIER
+    if knows_ability(TEMPORAL_BARRIER):
+        return TEMPORAL_BARRIER
+    return ICE_BARRIER
+
+
+def absorb_ready(aid, s):
+    if not aid or not knows_ability(aid):
+        return False
+    if has_aura(s, aid):
+        return False
+    if cooldown_remaining(aid, s) > 0.08:
+        return False
+    need = ABSORB_COST.get(aid, 40)
+    if (s.get("mana") or 0) < need:
+        return False
+    return True
+
+
+def press_shield(aid, s=None, wait=True):
+    """Cast one self absorb by ability id."""
+    s = s or snapshot()
+    if not aid:
+        return False, "empty", s
+    if not knows_ability(aid):
         return False, "unknown_ability", s
-    s = wait_until_ready(timeout=3.5)
-    if has_aura(s, BLAZING_BARRIER):
+    if wait:
+        s = wait_until_ready(timeout=3.5)
+    elif casting_or_gcd(s):
+        return False, "busy", s
+    if has_absorb(s):
         return False, "already", s
-    if cooldown_remaining(BLAZING_BARRIER, s) > 0.08:
+    if cooldown_remaining(aid, s) > 0.08:
         return False, "cd", s
-    if (s.get("mana") or 0) < BLAZING_BARRIER_COST:
+    need = ABSORB_COST.get(aid, 40)
+    if (s.get("mana") or 0) < need:
         return False, "mana", s
-    started, err, s = try_cast(BLAZING_BARRIER)
+    started, err, s = try_cast(aid)
+    return started, err, s
+
+
+def press_absorb(s=None, wait=True):
+    """Need absorb: bar 5 first. Only press bar 6 if 5 cannot land and no shield is up."""
+    s = s or snapshot()
+    if has_absorb(s):
+        return False, "already", None, s
+    primary = absorb_bar5()
+    fallback = absorb_bar6()
+    if absorb_ready(primary, s):
+        started, err, s = press_shield(primary, s, wait=wait)
+        if started:
+            _note_absorb_cast(primary)
+            return True, err, primary, s
+        if err == "already":
+            return False, err, primary, s
+        # 5 was ready but did not land. Confirm the shield is still missing
+        # before touching 6 — a just-applied 5 can look like a failed press.
+        _clear_snap_cache()
+        s = snapshot(fresh=True)
+        if has_absorb(s):
+            return False, "already", primary, s
+        if err != "cd":
+            return False, err, primary, s
+    if not fallback or fallback == primary:
+        return False, "cd" if primary else "empty", primary, s
+    _clear_snap_cache()
+    s = snapshot(fresh=True)
+    if has_absorb(s):
+        return False, "already", None, s
+    if not absorb_ready(fallback, s):
+        return False, "cd", fallback, s
+    started, err, s = press_shield(fallback, s, wait=wait)
+    if started:
+        _note_absorb_cast(fallback)
+        return True, err, fallback, s
+    return False, err, fallback, s
+
+
+def press_blazing_barrier(s=None):
+    """Bar 5, then bar 6 if 5 is down. Instant self shield."""
+    started, err, _used, s = press_absorb(s)
     return started, err, s
 
 
 def after_first_cinderbolt(s=None):
-    """Wait out the hard cast and GCD, then hit Blazing Barrier."""
+    """Wait out the hard cast and GCD, then hit bar 5 (or bar 6 if 5 is down)."""
     s = wait_while_casting(timeout=CINDERBOLT_CAST + 1.6, abort_on_attack=False)
     if not s.get("ok") or s.get("dead"):
         return False, "dead" if s.get("dead") else "no_game", s
     s = wait_until_ready(timeout=2.5)
-    started, err, s = press_blazing_barrier(s)
-    print("BAR5 blazing_barrier", json.dumps({"started": started, "err": err or None, "mana": s.get("mana")}))
+    started, err, used, s = press_absorb(s)
+    print(
+        "ABSORB after_cinder",
+        json.dumps({"started": started, "spell": used, "err": err or None, "mana": s.get("mana")}),
+    )
     return started, err, s
 
 
@@ -2565,7 +2774,7 @@ def tag_with_attack(eid, timeout=0.55):
 
 
 def home_cinder_then_barrier(eid):
-    """At the safespot: Cinderbolt, then Blazing Barrier. Never do this in the camp."""
+    """At the safespot: Cinderbolt, then bar 5 absorb (bar 6 if 5 is down). Never in the camp."""
     stop()
     s = wait_until_ready(timeout=2.5)
     mob = entity(eid)
